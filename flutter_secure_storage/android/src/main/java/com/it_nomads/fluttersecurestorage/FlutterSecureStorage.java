@@ -444,18 +444,81 @@ public class FlutterSecureStorage {
                                     SecurePreferencesCallback<Void> callback) {
         Log.i(TAG, "Starting non-biometric migration (no authentication required)...");
 
+        // [SIMULATE_HW_ERRORS] Track which step we're on and which step to fail at
+        final String STEP_TRACKER_KEY = "flutter_secure_storage_migration_step";
+        SharedPreferences debugPrefs = context.getSharedPreferences("flutter_secure_storage_debug", Context.MODE_PRIVATE);
+        int lastCompletedStep = debugPrefs.getInt(STEP_TRACKER_KEY, 0);
+        int stepToFailAt = lastCompletedStep + 1; // Fail at the next step
+
+        Log.w(TAG, "[SIMULATE_HW_ERRORS] Last completed step: " + lastCompletedStep);
+        Log.w(TAG, "[SIMULATE_HW_ERRORS] Will throw error at step: " + stepToFailAt);
+
         try {
             // Step 1: Get saved cipher (old algorithm, no auth needed)
             Log.d(TAG, "Step 1/6: Initializing saved cipher...");
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Starting Step 1 - sleeping 10 seconds...");
+            try {
+                Thread.sleep(10000);
+            } catch (InterruptedException e) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] Sleep interrupted", e);
+            }
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 1 sleep complete");
+
+            if (stepToFailAt == 1) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] SIMULATED FAILURE at Step 1!");
+                throw new Exception("SIMULATED HARDWARE ERROR at Step 1: Failed to initialize saved cipher (simulating slow eMMC read timeout)");
+            }
+
             StorageCipher savedCipher = storageCipherFactory.getSavedStorageCipher(context, null);
+            debugPrefs.edit().putInt(STEP_TRACKER_KEY, 1).apply();
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 1 completed successfully, recorded");
 
             // Step 2: Decrypt all data with old cipher
             Log.d(TAG, "Step 2/6: Decrypting all data with saved cipher...");
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Starting Step 2 - sleeping 10 seconds...");
+            try {
+                Thread.sleep(10000);
+            } catch (InterruptedException e) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] Sleep interrupted", e);
+            }
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 2 sleep complete");
+
+            if (stepToFailAt == 2) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] SIMULATED FAILURE at Step 2!");
+                throw new Exception("SIMULATED HARDWARE ERROR at Step 2: Failed to decrypt data (simulating corrupted storage read)");
+            }
+
             Map<String, String> decryptedCache = decryptAllWithSavedCipher(dataSource, savedCipher);
+            debugPrefs.edit().putInt(STEP_TRACKER_KEY, 2).apply();
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 2 completed successfully, recorded");
 
             // Step 3: Delete OLD RSA key from Android KeyStore
             // Critical: Must delete before creating new RSA key to avoid key collision
             Log.d(TAG, "Step 3/6: Deleting old RSA key from Android KeyStore...");
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Starting Step 3 - sleeping 10 seconds...");
+            try {
+                Thread.sleep(10000);
+            } catch (InterruptedException e) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] Sleep interrupted", e);
+            }
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 3 sleep complete");
+
+            if (stepToFailAt == 3) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] SIMULATED FAILURE at Step 3!");
+                // Simulate partial key deletion - delete keys first, then throw error
+                if (storageCipherFactory.changedKeyAlgorithm()) {
+                    try {
+                        KeyCipher savedKeyCipher = storageCipherFactory.getSavedKeyCipher(context);
+                        savedKeyCipher.deleteKey();
+                        savedCipher.deleteKey(context);
+                        Log.d(TAG, "Old key deleted from KeyStore");
+                    } catch (Exception deleteError) {
+                        Log.w(TAG, "Failed to delete old key from KeyStore (may not exist)", deleteError);
+                    }
+                }
+                throw new Exception("SIMULATED HARDWARE ERROR at Step 3: KeyStore operation failed after key deletion (simulating thermal throttling)");
+            }
+
             if (storageCipherFactory.changedKeyAlgorithm()) {
                 try {
                     KeyCipher savedKeyCipher = storageCipherFactory.getSavedKeyCipher(context);
@@ -467,31 +530,82 @@ public class FlutterSecureStorage {
                     Log.w(TAG, "Failed to delete old key from KeyStore (may not exist)", deleteError);
                 }
             }
+            debugPrefs.edit().putInt(STEP_TRACKER_KEY, 3).apply();
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 3 completed successfully, recorded");
 
             // Step 4: Update algorithm markers to current
             Log.d(TAG, "Step 4/6: Updating algorithm markers to current...");
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Starting Step 4 - sleeping 10 seconds...");
+            try {
+                Thread.sleep(10000);
+            } catch (InterruptedException e) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] Sleep interrupted", e);
+            }
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 4 sleep complete");
+
+            if (stepToFailAt == 4) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] SIMULATED FAILURE at Step 4!");
+                throw new Exception("SIMULATED HARDWARE ERROR at Step 4: Failed to update algorithm markers (simulating SharedPreferences write failure)");
+            }
+
             updateAlgorithmMarkers(configSource);
+            debugPrefs.edit().putInt(STEP_TRACKER_KEY, 4).apply();
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 4 completed successfully, recorded");
 
             // Step 5: Get current cipher (will create fresh keys with new algorithm)
             Log.d(TAG, "Step 5/6: Initializing current cipher with fresh AES key...");
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Starting Step 5 - sleeping 10 seconds...");
+            try {
+                Thread.sleep(10000);
+            } catch (InterruptedException e) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] Sleep interrupted", e);
+            }
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 5 sleep complete");
+
+            if (stepToFailAt == 5) {
+                Log.e(TAG, "[SIMULATE_HW_ERRORS] SIMULATED FAILURE at Step 5!");
+                throw new Exception("SIMULATED HARDWARE ERROR at Step 5: Failed to create new AES key (simulating KeyStore unavailable)");
+            }
+
             StorageCipher currentCipher = storageCipherFactory.getCurrentStorageCipher(context, null);
+            debugPrefs.edit().putInt(STEP_TRACKER_KEY, 5).apply();
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 5 completed successfully, recorded");
 
             if (decryptedCache.isEmpty()) {
                 Log.i(TAG, "Step 6/6: No data to migrate, continuing...");
             } else {
                 // Step 6: Encrypt all data with new cipher
                 Log.d(TAG, "Step 6/6: Encrypting all data with current cipher...");
+                Log.w(TAG, "[SIMULATE_HW_ERRORS] Starting Step 6 - sleeping 10 seconds...");
+                try {
+                    Thread.sleep(10000);
+                } catch (InterruptedException e) {
+                    Log.e(TAG, "[SIMULATE_HW_ERRORS] Sleep interrupted", e);
+                }
+                Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 6 sleep complete");
+
+                if (stepToFailAt == 6) {
+                    Log.e(TAG, "[SIMULATE_HW_ERRORS] SIMULATED FAILURE at Step 6!");
+                    throw new Exception("SIMULATED HARDWARE ERROR at Step 6: Failed to write encrypted data (simulating disk full / slow eMMC write timeout)");
+                }
+
                 encryptAllWithCurrentCipher(decryptedCache, dataSource, currentCipher);
+                debugPrefs.edit().putInt(STEP_TRACKER_KEY, 6).apply();
+                Log.w(TAG, "[SIMULATE_HW_ERRORS] Step 6 completed successfully, recorded");
             }
 
             // Update storageCipher to current
             storageCipher = currentCipher;
 
+            // Migration completed successfully - reset step tracker
+            debugPrefs.edit().putInt(STEP_TRACKER_KEY, 0).apply();
             Log.i(TAG, "Non-biometric migration completed successfully! Migrated " + decryptedCache.size() + " items.");
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Migration fully completed, step tracker reset to 0");
             callback.onSuccess(null);
 
         } catch (Exception e) {
             Log.e(TAG, "Non-biometric migration failed", e);
+            Log.e(TAG, "[SIMULATE_HW_ERRORS] Migration failed at step " + stepToFailAt + ", last completed: " + lastCompletedStep);
             callback.onError(new Exception("Non-biometric migration failed", e));
         }
     }
