@@ -420,8 +420,14 @@ public class FlutterSecureStorage {
             }
         }
 
-        editor.apply();
-        Log.d(TAG, "Successfully encrypted and saved " + count + " items with current cipher");
+        // Use commit() instead of apply() to guarantee data is written to disk
+        // before returning. This prevents data loss if the app is force-killed
+        // immediately after migration (e.g., on slow eMMC storage devices).
+        boolean success = editor.commit();
+        if (!success) {
+            throw new Exception("Failed to commit encrypted data to disk - storage may be full or unavailable");
+        }
+        Log.d(TAG, "Successfully encrypted and committed " + count + " items with current cipher to disk");
     }
 
     /**
