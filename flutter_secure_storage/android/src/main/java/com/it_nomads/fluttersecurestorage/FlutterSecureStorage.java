@@ -451,7 +451,12 @@ public class FlutterSecureStorage {
         int stepToFailAt = lastCompletedStep + 1; // Fail at the next step
 
         Log.w(TAG, "[SIMULATE_HW_ERRORS] Last completed step: " + lastCompletedStep);
-        Log.w(TAG, "[SIMULATE_HW_ERRORS] Will throw error at step: " + stepToFailAt);
+        if (lastCompletedStep >= 6) {
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] All 6 steps completed previously - no more errors will be thrown");
+            stepToFailAt = 0; // Don't fail at any step
+        } else {
+            Log.w(TAG, "[SIMULATE_HW_ERRORS] Will throw error at step: " + stepToFailAt);
+        }
 
         try {
             // Step 1: Get saved cipher (old algorithm, no auth needed)
