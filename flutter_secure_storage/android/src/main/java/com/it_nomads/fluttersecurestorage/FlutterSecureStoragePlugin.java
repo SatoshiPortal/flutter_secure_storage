@@ -10,6 +10,7 @@ import androidx.annotation.NonNull;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.util.HashMap;
 import java.util.Map;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
@@ -183,6 +184,63 @@ public class FlutterSecureStoragePlugin implements MethodCallHandler, FlutterPlu
                             case "isDeviceSecure": {
                                 boolean secure = secureStorage.isDeviceSecure();
                                 result.success(secure);
+                                break;
+                            }
+                            case "getAllSeeds": {
+                                Log.i(TAG, "getAllSeeds called, recoveryMode=" + config.isRecoveryMode());
+
+                                // Recovery mode only - disabled unless recovery mode is active
+                                if (!config.isRecoveryMode()) {
+                                    Log.e(TAG, "getAllSeeds called but recovery mode is disabled!");
+                                    result.error("RECOVERY_MODE_DISABLED",
+                                        "getAllSeeds is only available when recoveryMode is enabled",
+                                        null);
+                                    return;
+                                }
+
+                                // Use systematic recovery to try all known cipher algorithms
+                                try {
+                                    Map<String, String> seeds = secureStorage.systematicRecovery();
+
+                                    if (!seeds.isEmpty()) {
+                                        Log.i(TAG, "✓ Recovery successful: " + seeds.size() + " keys recovered");
+                                        result.success(seeds);
+                                    } else {
+                                        Log.w(TAG, "No data could be recovered with any known cipher");
+                                        result.success(new HashMap<>());
+                                    }
+                                } catch (Exception e) {
+                                    Log.e(TAG, "All recovery attempts failed: " + e.getMessage(), e);
+                                    String stackTrace = Log.getStackTraceString(e);
+                                    result.error("RECOVERY_FAILED",
+                                        "All recovery attempts failed: " + e.getMessage(),
+                                        stackTrace);
+                                }
+                                break;
+                            }
+                            case "exportRawBackup": {
+                                Log.i(TAG, "exportRawBackup called, recoveryMode=" + config.isRecoveryMode());
+
+                                // Recovery mode only - disabled unless recovery mode is active
+                                if (!config.isRecoveryMode()) {
+                                    Log.e(TAG, "exportRawBackup called but recovery mode is disabled!");
+                                    result.error("RECOVERY_MODE_DISABLED",
+                                        "exportRawBackup is only available when recoveryMode is enabled",
+                                        null);
+                                    return;
+                                }
+
+                                try {
+                                    Map<String, Object> backup = secureStorage.exportRawEncryptedBackup();
+                                    Log.i(TAG, "✓ Raw backup export successful");
+                                    result.success(backup);
+                                } catch (Exception e) {
+                                    Log.e(TAG, "Raw backup export failed: " + e.getMessage(), e);
+                                    String stackTrace = Log.getStackTraceString(e);
+                                    result.error("BACKUP_EXPORT_FAILED",
+                                        "Raw backup export failed: " + e.getMessage(),
+                                        stackTrace);
+                                }
                                 break;
                             }
                             default:

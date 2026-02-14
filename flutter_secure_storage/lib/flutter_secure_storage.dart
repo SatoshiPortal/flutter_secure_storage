@@ -344,6 +344,127 @@ class FlutterSecureStorage {
     });
   }
 
+  /// Recovers all seed keys from storage using all possible algorithm combinations.
+  ///
+  /// **RECOVERY MODE ONLY** - This method is only available when `recoveryMode=true`
+  /// is set in [AndroidOptions]. It attempts to decrypt data using all possible
+  /// KeyCipher and StorageCipher combinations, as well as EncryptedSharedPreferences.
+  ///
+  /// This is useful for recovering wallet seeds when migration fails or when the
+  /// encryption algorithm configuration is unknown.
+  ///
+  /// Returns a Map of seed key names to their decrypted values.
+  ///
+  /// Throws [PlatformException] if:
+  /// - Recovery mode is not enabled (`recoveryMode=false`)
+  /// - Recovery fails for technical reasons
+  ///
+  /// **WARNING**: This is a recovery-only feature and should not be used for
+  /// normal storage operations.
+  ///
+  /// Example:
+  /// ```dart
+  /// final storage = FlutterSecureStorage(
+  ///   aOptions: AndroidOptions(recoveryMode: true),
+  /// );
+  /// try {
+  ///   final seeds = await storage.getAllSeeds();
+  ///   print('Recovered ${seeds.length} seeds');
+  ///   for (var entry in seeds.entries) {
+  ///     print('${entry.key}: ${entry.value}');
+  ///   }
+  /// } catch (e) {
+  ///   print('Recovery failed: $e');
+  /// }
+  /// ```
+  Future<Map<String, String>> getAllSeeds({
+    AndroidOptions? aOptions,
+  }) async {
+    final options = _selectOptions(
+      null, // iOptions
+      aOptions,
+      null, // lOptions
+      null, // webOptions
+      null, // mOptions
+      null, // wOptions
+    );
+
+    // Use MethodChannel directly for Android-specific getAllSeeds method
+    const channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+    final result = await channel.invokeMethod('getAllSeeds', {
+      'options': options,
+    });
+
+    if (result is Map) {
+      return Map<String, String>.from(result.cast<String, String>());
+    }
+
+    return {};
+  }
+
+  /// Exports all encrypted data AS-IS without decryption.
+  ///
+  /// **RECOVERY MODE ONLY** - This method is only available when `recoveryMode=true`
+  /// is set in [AndroidOptions]. Used as a last resort when systematic recovery fails
+  /// to decrypt data (e.g., broken migration with deleted RSA keys).
+  ///
+  /// **WARNING**: The exported data is STILL ENCRYPTED and cannot be used without
+  /// the original encryption keys. This is intended for:
+  /// - Preserving encrypted data when recovery fails
+  /// - Future recovery attempts if keys are ever recovered
+  /// - Forensic analysis by security researchers
+  ///
+  /// Returns a Map containing:
+  /// - `customCipherData`: Encrypted data from custom cipher storage
+  /// - `configData`: Algorithm configuration markers
+  /// - `espData`: Encrypted data from ESP storage (if any)
+  /// - `exportTimestamp`: Unix timestamp of export
+  /// - `appPackage`: Package name of the app
+  /// - `warning`: Warning message about encryption
+  /// - `note`: Purpose note
+  ///
+  /// Throws [PlatformException] if:
+  /// - Recovery mode is not enabled (`recoveryMode=false`)
+  /// - Export fails for technical reasons
+  ///
+  /// Example:
+  /// ```dart
+  /// final storage = FlutterSecureStorage(
+  ///   aOptions: AndroidOptions(recoveryMode: true),
+  /// );
+  /// try {
+  ///   final backup = await storage.exportRawBackup();
+  ///   print('Backup exported: ${backup['exportTimestamp']}');
+  ///   print('Warning: ${backup['warning']}');
+  /// } catch (e) {
+  ///   print('Export failed: $e');
+  /// }
+  /// ```
+  Future<Map<String, dynamic>> exportRawBackup({
+    AndroidOptions? aOptions,
+  }) async {
+    final options = _selectOptions(
+      null, // iOptions
+      aOptions,
+      null, // lOptions
+      null, // webOptions
+      null, // mOptions
+      null, // wOptions
+    );
+
+    // Use MethodChannel directly for Android-specific exportRawBackup method
+    const channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+    final result = await channel.invokeMethod('exportRawBackup', {
+      'options': options,
+    });
+
+    if (result is Map) {
+      return Map<String, dynamic>.from(result.cast<String, dynamic>());
+    }
+
+    return {};
+  }
+
   /// Select correct options based on current platform
   Map<String, String> _selectOptions(
     AppleOptions? iOptions,

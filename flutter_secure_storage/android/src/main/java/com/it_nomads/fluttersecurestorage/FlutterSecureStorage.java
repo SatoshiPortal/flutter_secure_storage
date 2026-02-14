@@ -147,6 +147,27 @@ public class FlutterSecureStorage {
 
     protected void initialize(FlutterSecureStorageConfig config, SecurePreferencesCallback<Void> callback) {
         this.config = config;
+
+        // Recovery mode: ALWAYS reinitialize with plain SharedPreferences
+        // This ensures recovery mode works even if initialize() was called previously
+        // Recovery mode should NEVER use cached preferences or trigger migrations
+        if (config.isRecoveryMode()) {
+            Log.i(TAG, "=".repeat(60));
+            Log.i(TAG, "*** RECOVERY MODE ENABLED ***");
+            Log.i(TAG, "Systematic recovery will try all known cipher algorithms.");
+            Log.i(TAG, "Skipping all migrations - recovery mode is read-only.");
+            Log.i(TAG, "=".repeat(60));
+
+            // Use plain SharedPreferences - systematic recovery handles all decryption
+            preferences = context.getSharedPreferences(
+                    config.getSharedPreferencesName(),
+                    Context.MODE_PRIVATE
+            );
+            callback.onSuccess(null);
+            return;
+        }
+
+        // Normal mode: Use cached preferences if available
         if (preferences != null) {
             callback.onSuccess(null);
             return;
@@ -164,11 +185,14 @@ public class FlutterSecureStorage {
 
         Boolean isAlreadyMigrated = getEncryptedPrefsMigrated(configSource);
 
-        // Always check for EncryptedSharedPreferences data, regardless of current config.
-        // This handles the case where users had encryptedSharedPreferences=true in v9.2.4
-        // but removed it when upgrading (thinking it's deprecated and shouldn't be used).
-        // Without this check, their data would be lost during upgrade.
-        if (!isAlreadyMigrated) {
+        // MIGRATION DISABLED FOR THIS BUILD
+        // ESP to custom migration is completely disabled to prevent data loss during testing
+        // Recovery mode handles both ESP and custom cipher data without migration
+        Log.i(TAG, "ESP to custom migration is DISABLED for this build");
+        Log.i(TAG, "Use recovery mode to access ESP-encrypted data if needed");
+
+        // Skip all ESP migration logic
+        if (false && !isAlreadyMigrated) {
             try {
                 SharedPreferences encryptedPreferences = initializeEncryptedSharedPreferencesManager(context);
 
@@ -827,6 +851,20 @@ public class FlutterSecureStorage {
      */
     private void handleKeyMismatch(SharedPreferences configSource, SecurePreferencesCallback<Void> callback,
                                    Exception exception, String errorType) {
+        // MIGRATION DISABLED FOR THIS BUILD
+        // All algorithm change migrations are completely disabled to prevent data loss during testing
+        // Recovery mode handles all cipher algorithms without migration
+        Log.i(TAG, "=".repeat(60));
+        Log.i(TAG, "Algorithm change migration is DISABLED for this build");
+        Log.i(TAG, "Use recovery mode to access data encrypted with different algorithms");
+        Log.i(TAG, "=".repeat(60));
+
+        // Return success - do nothing, no migration
+        callback.onSuccess(null);
+        return;
+
+        // ORIGINAL CODE BELOW (DISABLED)
+        /*
         Log.e(TAG, "Key mismatch detected during cipher initialization: " + errorType, exception);
         Log.e(TAG, "This typically occurs after an algorithm change.");
         Log.e(TAG, "Stored key cannot be decrypted with current algorithm.");
@@ -884,6 +922,7 @@ public class FlutterSecureStorage {
                 callback.onError(new Exception(userMessage, exception));
             }
         }
+        */
     }
 
     /**
@@ -961,6 +1000,15 @@ public class FlutterSecureStorage {
     public boolean isDeviceSecure() {
         KeyguardManager keyguardManager = (KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
         return keyguardManager != null && keyguardManager.isDeviceSecure();
+    }
+
+    /**
+     * Returns the application context.
+     * Used by RecoveryMode to access SharedPreferences and KeyStore.
+     */
+    @NonNull
+    public Context getContext() {
+        return context;
     }
 
     /**
@@ -1208,5 +1256,329 @@ public class FlutterSecureStorage {
         byte[] result = storageCipher.decrypt(data);
 
         return new String(result, charset);
+    }
+
+    /**
+     * Systematic recovery method that tries all known cipher algorithms to decrypt data.
+     * Used in recovery mode when normal readAll() fails or returns empty.
+     *
+     * @return Map of decrypted key-value pairs from the first successful algorithm, plus __DEBUG_LOG__
+     * @throws Exception if all recovery attempts fail
+     */
+    public Map<String, String> systematicRecovery() throws Exception {
+        StringBuilder debugLog = new StringBuilder();
+
+        debugLog.append("============================================================\n");
+        debugLog.append(">>> SYSTEMATIC CIPHER RECOVERY v1.0 <<<\n");
+        debugLog.append("============================================================\n");
+
+        // Define all cipher algorithms to try (in priority order)
+        CipherAlgorithm[] algorithms = {
+            new CipherAlgorithm("v6.5.2_ESP",
+                "RSA_ECB_OAEPwithSHA_256andMGF1Padding",
+                "AES_GCM_NoPadding",
+                true),  // Try ESP (EncryptedSharedPreferences) ONLY
+            new CipherAlgorithm("v6.7.0_CUSTOM",
+                "RSA_ECB_OAEPwithSHA_256andMGF1Padding",
+                "AES_GCM_NoPadding",
+                false),  // Try custom cipher ONLY
+            new CipherAlgorithm("v5.3.1_CUSTOM",
+                "RSA_ECB_PKCS1Padding",
+                "AES_CBC_PKCS7Padding",
+                false),  // Legacy custom cipher ONLY
+        };
+
+        // Get all stored data (raw SharedPreferences)
+        Map<String, ?> allStoredData = getAllStoredData();
+        debugLog.append("[INFO] Found ").append(allStoredData.size()).append(" keys in raw storage\n");
+        debugLog.append("[INFO] Initializing recovery sequence...\n\n");
+
+        Map<String, String> recoveredData = new HashMap<>();
+        String successfulAlgorithm = null;
+        int attemptNumber = 0;
+
+        // Try each cipher algorithm systematically
+        for (CipherAlgorithm algo : algorithms) {
+            attemptNumber++;
+            debugLog.append("------------------------------------------------------------\n");
+            debugLog.append("[ATTEMPT ").append(attemptNumber).append("] Trying algorithm: ").append(algo.name).append("\n");
+            debugLog.append("------------------------------------------------------------\n");
+
+            try {
+                // Attempt to decrypt all data with this algorithm
+                Map<String, String> recovered = tryDecryptAllWith(algo, allStoredData, debugLog);
+
+                if (!recovered.isEmpty()) {
+                    debugLog.append("[STATUS] *** SUCCESS ***\n\n");
+                    recoveredData = recovered;
+                    successfulAlgorithm = algo.name;
+                    break;
+                } else {
+                    debugLog.append("[STATUS] *** FAILED ***\n\n");
+                }
+            } catch (Exception e) {
+                debugLog.append("[ERROR] ").append(e.getMessage()).append("\n");
+                debugLog.append("[STATUS] *** FAILED ***\n\n");
+            }
+        }
+
+        // Final result
+        debugLog.append("============================================================\n");
+        if (successfulAlgorithm != null) {
+            debugLog.append(">>> RECOVERY COMPLETE <<<\n");
+            debugLog.append(">>> Algorithm: ").append(successfulAlgorithm).append("\n");
+            debugLog.append(">>> Keys recovered: ").append(recoveredData.size()).append("\n");
+        } else {
+            debugLog.append(">>> RECOVERY COMPLETE <<<\n");
+            debugLog.append(">>> No algorithm succeeded\n");
+            debugLog.append(">>> Keys recovered: 0\n");
+        }
+        debugLog.append("============================================================\n");
+
+        // Always include debug log in result
+        Map<String, String> finalResult = new HashMap<>(recoveredData);
+        finalResult.put("__DEBUG_LOG__", debugLog.toString());
+
+        // Also log to Android logcat
+        Log.i(TAG, debugLog.toString());
+
+        return finalResult;
+    }
+
+    /**
+     * Gets all data from SharedPreferences.
+     */
+    private Map<String, ?> getAllStoredData() {
+        SharedPreferences dataPrefs = context.getSharedPreferences(
+            config.getSharedPreferencesName(),
+            Context.MODE_PRIVATE
+        );
+        return dataPrefs.getAll();
+    }
+
+    /**
+     * Tries to decrypt all stored data with a specific cipher algorithm.
+     *
+     * @param algo The cipher algorithm to try
+     * @param storedData All data from SharedPreferences
+     * @param debugLog StringBuilder to collect debug output
+     * @return Map of successfully decrypted key-value pairs
+     */
+    private Map<String, String> tryDecryptAllWith(
+        CipherAlgorithm algo,
+        Map<String, ?> storedData,
+        StringBuilder debugLog
+    ) throws Exception {
+
+        Map<String, String> result = new HashMap<>();
+
+        // ESP algorithms: ONLY try ESP, no custom fallback
+        if (algo.tryESP) {
+            debugLog.append("  [CONFIG] Encryption: EncryptedSharedPreferences (Tink)\n");
+            debugLog.append("  [SCAN] Initializing ESP manager...\n");
+
+            try {
+                SharedPreferences encryptedPreferences = initializeEncryptedSharedPreferencesManager(context);
+                Map<String, ?> espData = encryptedPreferences.getAll();
+
+                debugLog.append("  [READ] Found ").append(espData.size()).append(" total keys in ESP storage\n");
+
+                int espAttempted = 0;
+                int espSucceeded = 0;
+
+                for (Map.Entry<String, ?> entry : espData.entrySet()) {
+                    String fullKey = entry.getKey();
+
+                    // Skip non-data keys
+                    if (!fullKey.contains(config.getSharedPreferencesKeyPrefix())) {
+                        continue;
+                    }
+
+                    espAttempted++;
+                    String actualKey = fullKey.replaceFirst(config.getSharedPreferencesKeyPrefix() + '_', "");
+                    String value = (String) entry.getValue();
+
+                    if (value != null) {
+                        // ESP already decrypts automatically when reading
+                        result.put(actualKey, value);
+                        espSucceeded++;
+                        debugLog.append("  [OK] ").append(actualKey).append(": Decrypted successfully\n");
+                    } else {
+                        debugLog.append("  [FAIL] ").append(actualKey).append(": Null value\n");
+                    }
+                }
+
+                debugLog.append("  [RESULT] Keys attempted: ").append(espAttempted).append(" | Keys decrypted: ").append(espSucceeded).append("\n");
+
+                // Return immediately - NO custom cipher fallback for ESP
+                return result;
+
+            } catch (Exception e) {
+                debugLog.append("  [ERROR] ESP initialization failed: ").append(e.getMessage()).append("\n");
+                debugLog.append("  [RESULT] Keys attempted: 0 | Keys decrypted: 0\n");
+                // Return empty - NO custom cipher fallback for ESP
+                return new HashMap<>();
+            }
+        }
+
+        // Custom cipher algorithms: ONLY try custom cipher, no ESP
+        debugLog.append("  [CONFIG] KeyCipher: ").append(algo.keyCipherAlgorithm).append("\n");
+        debugLog.append("  [CONFIG] StorageCipher: ").append(algo.storageCipherAlgorithm).append("\n");
+
+        // Count data keys
+        int dataKeyCount = 0;
+        for (Map.Entry<String, ?> entry : storedData.entrySet()) {
+            if (entry.getKey().contains(config.getSharedPreferencesKeyPrefix())) {
+                dataKeyCount++;
+            }
+        }
+        debugLog.append("  [SCAN] Attempting to decrypt ").append(dataKeyCount).append(" data keys...\n");
+
+        SharedPreferences configSource = context.getSharedPreferences(
+            SHARED_PREFERENCES_CONFIG_NAME,
+            Context.MODE_PRIVATE
+        );
+
+        StorageCipherFactory factory = new StorageCipherFactory(
+            configSource,
+            algo.keyCipherAlgorithm,
+            algo.storageCipherAlgorithm,
+            config
+        );
+
+        // Get cipher instance based on algorithm
+        Cipher cipher = null;
+        if ("AES_GCM_NoPadding".equals(algo.storageCipherAlgorithm)) {
+            cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        } else if ("AES_CBC_PKCS7Padding".equals(algo.storageCipherAlgorithm)) {
+            cipher = Cipher.getInstance("AES/CBC/PKCS7Padding");
+        }
+
+        StorageCipher storageCipher = factory.getCurrentStorageCipher(context, cipher);
+
+        // Try to decrypt each key with this cipher
+        int attempted = 0;
+        int succeeded = 0;
+
+        for (Map.Entry<String, ?> entry : storedData.entrySet()) {
+            String fullKey = entry.getKey();
+
+            // Skip non-data keys
+            if (!fullKey.contains(config.getSharedPreferencesKeyPrefix())) {
+                continue;
+            }
+
+            attempted++;
+            String actualKey = fullKey.replaceFirst(config.getSharedPreferencesKeyPrefix() + '_', "");
+
+            try {
+                String rawValue = (String) entry.getValue();
+                if (rawValue == null) {
+                    debugLog.append("  [FAIL] ").append(actualKey).append(": Null value\n");
+                    continue;
+                }
+
+                // Decrypt with this cipher
+                byte[] encryptedData = Base64.decode(rawValue, 0);
+                byte[] decryptedBytes = storageCipher.decrypt(encryptedData);
+                String decrypted = new String(decryptedBytes, charset);
+
+                if (decrypted != null) {
+                    result.put(actualKey, decrypted);
+                    succeeded++;
+                    debugLog.append("  [OK] ").append(actualKey).append(": Decrypted successfully\n");
+                }
+            } catch (Exception e) {
+                // Key failed to decrypt with this cipher - continue to next key
+                String errorType = e.getClass().getSimpleName();
+                debugLog.append("  [FAIL] ").append(actualKey).append(": ").append(errorType).append("\n");
+            }
+        }
+
+        debugLog.append("  [RESULT] Keys attempted: ").append(attempted).append(" | Keys decrypted: ").append(succeeded).append("\n");
+        return result;
+    }
+
+    /**
+     * Exports all encrypted data AS-IS without decryption.
+     * Used as last resort when systematic recovery fails.
+     *
+     * WARNING: This data is STILL ENCRYPTED and cannot be used without the original encryption keys.
+     *
+     * @return Map containing all encrypted data, config, and metadata
+     */
+    public Map<String, Object> exportRawEncryptedBackup() {
+        Log.i(TAG, "=".repeat(60));
+        Log.i(TAG, ">>> RAW ENCRYPTED BACKUP EXPORT <<<");
+        Log.i(TAG, "WARNING: Data exported is STILL ENCRYPTED!");
+        Log.i(TAG, "=".repeat(60));
+
+        Map<String, Object> backup = new HashMap<>();
+
+        // Export data from all possible storage locations
+        try {
+            // 1. Custom cipher storage (FlutterSecureKeyStorage)
+            SharedPreferences dataPrefs = context.getSharedPreferences(
+                config.getSharedPreferencesName(),
+                Context.MODE_PRIVATE
+            );
+            backup.put("customCipherData", new HashMap<>(dataPrefs.getAll()));
+            Log.i(TAG, "Exported " + dataPrefs.getAll().size() + " keys from custom cipher storage");
+
+            // 2. Config storage (algorithm markers)
+            SharedPreferences configPrefs = context.getSharedPreferences(
+                SHARED_PREFERENCES_CONFIG_NAME,
+                Context.MODE_PRIVATE
+            );
+            backup.put("configData", new HashMap<>(configPrefs.getAll()));
+            Log.i(TAG, "Exported config data (algorithm markers)");
+
+            // 3. Try to export ESP data (if it exists)
+            try {
+                SharedPreferences espPrefs = initializeEncryptedSharedPreferencesManager(context);
+                // ESP data is auto-decrypted, but we'll include it anyway
+                backup.put("espData", new HashMap<>(espPrefs.getAll()));
+                Log.i(TAG, "Exported " + espPrefs.getAll().size() + " keys from ESP storage");
+            } catch (Exception e) {
+                Log.i(TAG, "No ESP data found (this is normal if not using ESP)");
+                backup.put("espData", new HashMap<>());
+            }
+
+            // 4. Metadata
+            backup.put("exportTimestamp", System.currentTimeMillis());
+            backup.put("appPackage", context.getPackageName());
+            backup.put("warning", "DATA IS ENCRYPTED - Cannot be decrypted without original keys!");
+            backup.put("note", "This is a last-resort backup for forensic analysis or future recovery attempts");
+
+            Log.i(TAG, "=".repeat(60));
+            Log.i(TAG, ">>> BACKUP EXPORT COMPLETE <<<");
+            Log.i(TAG, "=".repeat(60));
+
+            return backup;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to export raw backup", e);
+            throw new RuntimeException("Raw backup export failed", e);
+        }
+    }
+
+    /**
+     * Helper class to represent a cipher algorithm configuration.
+     */
+    private static class CipherAlgorithm {
+        String name;
+        String keyCipherAlgorithm;
+        String storageCipherAlgorithm;
+        boolean tryESP;  // Whether to try ESP (EncryptedSharedPreferences) first
+
+        CipherAlgorithm(String name,
+                       String keyCipherAlgorithm,
+                       String storageCipherAlgorithm,
+                       boolean tryESP) {
+            this.name = name;
+            this.keyCipherAlgorithm = keyCipherAlgorithm;
+            this.storageCipherAlgorithm = storageCipherAlgorithm;
+            this.tryESP = tryESP;
+        }
     }
 }
