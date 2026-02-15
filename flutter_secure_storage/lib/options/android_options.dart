@@ -50,6 +50,7 @@ class AndroidOptions extends Options {
     bool encryptedSharedPreferences = false,
     bool resetOnError = true,
     bool migrateOnAlgorithmChange = true,
+    bool migrateWithBackup = false,
     bool recoveryMode = false,
     bool enforceBiometrics = false,
     KeyCipherAlgorithm keyCipherAlgorithm =
@@ -63,6 +64,7 @@ class AndroidOptions extends Options {
   })  : _encryptedSharedPreferences = encryptedSharedPreferences,
         _resetOnError = resetOnError,
         _migrateOnAlgorithmChange = migrateOnAlgorithmChange,
+        _migrateWithBackup = migrateWithBackup,
         _recoveryMode = recoveryMode,
         _enforceBiometrics = enforceBiometrics,
         _keyCipherAlgorithm = keyCipherAlgorithm,
@@ -84,6 +86,7 @@ class AndroidOptions extends Options {
     bool encryptedSharedPreferences = false,
     bool resetOnError = true,
     bool migrateOnAlgorithmChange = true,
+    bool migrateWithBackup = false,
     bool recoveryMode = false,
     bool enforceBiometrics = false,
     this.sharedPreferencesName,
@@ -93,6 +96,7 @@ class AndroidOptions extends Options {
   })  : _encryptedSharedPreferences = encryptedSharedPreferences,
         _resetOnError = resetOnError,
         _migrateOnAlgorithmChange = migrateOnAlgorithmChange,
+        _migrateWithBackup = migrateWithBackup,
         _recoveryMode = recoveryMode,
         _enforceBiometrics = enforceBiometrics,
         _keyCipherAlgorithm = KeyCipherAlgorithm.AES_GCM_NoPadding,
@@ -115,6 +119,25 @@ class AndroidOptions extends Options {
   ///
   /// Defaults to true.
   final bool _migrateOnAlgorithmChange;
+
+  /// When the encryption algorithm changes, create a backup of encrypted data
+  /// before migration using a rename-based strategy. This provides an additional
+  /// safety net - if migration fails, the original encrypted data is preserved
+  /// with a _BACKUP suffix and can be recovered.
+  ///
+  /// The backup mechanism uses a three-phase approach:
+  /// 1. Copy encrypted data to keys with _BACKUP suffix
+  /// 2. Mark backup as complete in SharedPreferences
+  /// 3. Delete original (non-backup) keys
+  ///
+  /// If migration fails at any point, the _BACKUP data can be used to recover.
+  ///
+  /// **Note**: This works in conjunction with migrateOnAlgorithmChange.
+  /// If migrateOnAlgorithmChange is false, no migration (with or without backup)
+  /// will occur.
+  ///
+  /// Defaults to false.
+  final bool _migrateWithBackup;
 
   /// Recovery mode: attempts to decrypt data with all possible algorithm
   /// combinations to recover seed keys, regardless of current configuration.
@@ -185,6 +208,7 @@ class AndroidOptions extends Options {
         'encryptedSharedPreferences': '$_encryptedSharedPreferences',
         'resetOnError': '$_resetOnError',
         'migrateOnAlgorithmChange': '$_migrateOnAlgorithmChange',
+        'migrateWithBackup': '$_migrateWithBackup',
         'recoveryMode': '$_recoveryMode',
         'enforceBiometrics': '$_enforceBiometrics',
         'keyCipherAlgorithm': _keyCipherAlgorithm.name,
@@ -202,6 +226,7 @@ class AndroidOptions extends Options {
     bool? encryptedSharedPreferences,
     bool? resetOnError,
     bool? migrateOnAlgorithmChange,
+    bool? migrateWithBackup,
     bool? recoveryMode,
     bool? enforceBiometrics,
     KeyCipherAlgorithm? keyCipherAlgorithm,
@@ -219,6 +244,7 @@ class AndroidOptions extends Options {
         resetOnError: resetOnError ?? _resetOnError,
         migrateOnAlgorithmChange:
             migrateOnAlgorithmChange ?? _migrateOnAlgorithmChange,
+        migrateWithBackup: migrateWithBackup ?? _migrateWithBackup,
         recoveryMode: recoveryMode ?? _recoveryMode,
         enforceBiometrics: enforceBiometrics ?? _enforceBiometrics,
         keyCipherAlgorithm: keyCipherAlgorithm ?? _keyCipherAlgorithm,
