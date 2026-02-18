@@ -47,10 +47,15 @@ public class StorageCipherFactory {
         final KeyCipherAlgorithm currentKeyAlgorithmTmp = KeyCipherAlgorithm.fromString(keyCipherAlgorithm);
         currentKeyAlgorithm = (currentKeyAlgorithmTmp.minVersionCode <= Build.VERSION.SDK_INT) ? currentKeyAlgorithmTmp : DEFAULT_KEY_ALGORITHM;
 
+        // Store algorithm markers immediately ONLY if migrateWithBackup is disabled
+        // When migrateWithBackup=true, markers are stored AFTER successful migration (step 7)
+        // to ensure migration can be retried if it fails
         if (savedKeyCipherAlgorithm == null || savedStorageCipherAlgorithm == null) {
-            final SharedPreferences.Editor source = configSource.edit();
-            storeCurrentAlgorithms(source);
-            source.apply();
+            if (!config.shouldMigrateWithBackup()) {
+                final SharedPreferences.Editor source = configSource.edit();
+                storeCurrentAlgorithms(source);
+                source.apply();
+            }
         }
     }
 

@@ -37,6 +37,27 @@ public class MigrationBackup {
                                    SharedPreferences configSource,
                                    FlutterSecureStorageConfig config,
                                    String keyPrefix) {
+        createBackup(dataSource, keyStorage, null, configSource, config, keyPrefix);
+    }
+
+    /**
+     * Creates backup by copying encrypted entries to <key>_BACKUP, then deleting originals.
+     * Follows rename workflow: copy → mark complete → delete originals.
+     * Can also backup ESP data if espSource is provided.
+     *
+     * @param dataSource SharedPreferences containing encrypted user data
+     * @param keyStorage SharedPreferences containing wrapped AES keys
+     * @param espSource EncryptedSharedPreferences source (can be null)
+     * @param configSource SharedPreferences for backup status tracking
+     * @param config Configuration object
+     * @param keyPrefix Prefix to filter data keys
+     */
+    public static void createBackup(SharedPreferences dataSource,
+                                   SharedPreferences keyStorage,
+                                   SharedPreferences espSource,
+                                   SharedPreferences configSource,
+                                   FlutterSecureStorageConfig config,
+                                   String keyPrefix) {
         // Check if backup already exists - skip if complete or deleted
         String status = getBackupStatus(configSource, config);
         if (STATUS_COMPLETE.equals(status) || STATUS_DELETED.equals(status)) {
@@ -47,7 +68,7 @@ public class MigrationBackup {
         // If status is "started", delete incomplete backup and start fresh
         if (STATUS_STARTED.equals(status)) {
             Log.w(TAG, "Found incomplete backup (status: started), deleting and restarting");
-            deleteBackupData(dataSource, keyStorage, keyPrefix);
+            deleteBackupData(dataSource, keyStorage, espSource, keyPrefix);
         }
 
         Log.i(TAG, "Starting backup creation (rename operation)...");
@@ -57,8 +78,36 @@ public class MigrationBackup {
 
         int dataCount = 0;
         int keyCount = 0;
+        int espCount = 0;
 
-        // Step 1: Copy encrypted user data to _BACKUP
+        // Step 1a: Copy ESP data to _BACKUP within ESP itself if ESP source provided
+        if (espSource != null) {
+            Log.i(TAG, "Backing up EncryptedSharedPreferences data with _BACKUP suffix...");
+            try {
+                SharedPreferences.Editor espEditor = espSource.edit();
+                for (Map.Entry<String, ?> entry : espSource.getAll().entrySet()) {
+                    String key = entry.getKey();
+                    if (entry.getValue() instanceof String && key.contains(keyPrefix) && !key.endsWith(BACKUP_SUFFIX)) {
+                        // Copy ESP data: <key> → <key>_BACKUP (within ESP storage)
+                        // ESP handles encryption, so the backed-up key remains encrypted
+                        espEditor.putString(key + BACKUP_SUFFIX, (String) entry.getValue());
+                        espCount++;
+                    }
+                }
+                if (!espEditor.commit()) {
+                    throw new RuntimeException("Failed to copy ESP data to backup");
+                }
+                Log.i(TAG, "Backed up " + espCount + " items in ESP");
+            } catch (Exception espError) {
+                // ESP is corrupted and can't be read - skip ESP backup
+                // The migration will proceed with algorithm mismatch handling
+                Log.w(TAG, "ESP backup failed (ESP corrupted): " + espError.getMessage());
+                Log.w(TAG, "Skipping ESP backup - migration will use algorithm mismatch recovery");
+                espCount = 0;
+            }
+        }
+
+        // Step 1b: Copy encrypted user data to _BACKUP
         SharedPreferences.Editor dataEditor = dataSource.edit();
         for (Map.Entry<String, ?> entry : dataSource.getAll().entrySet()) {
             String key = entry.getKey();
@@ -93,8 +142,23 @@ public class MigrationBackup {
         // Step 4: Now safe to delete originals (rename operation)
         deleteOriginalData(dataSource, keyStorage, keyPrefix);
 
+        // Step 5: Delete original ESP keys (keep _BACKUP ones)
+        if (espSource != null && espCount > 0) {
+            Log.i(TAG, "Deleting original ESP keys (keeping _BACKUP)...");
+            SharedPreferences.Editor espEditor = espSource.edit();
+            for (Map.Entry<String, ?> entry : espSource.getAll().entrySet()) {
+                String key = entry.getKey();
+                // Delete original keys, keep _BACKUP keys
+                if (key.contains(keyPrefix) && !key.endsWith(BACKUP_SUFFIX)) {
+                    espEditor.remove(key);
+                }
+            }
+            espEditor.commit();
+            Log.i(TAG, "Original ESP keys deleted (renamed to _BACKUP)");
+        }
+
         Log.i(TAG, "Backup created (rename complete): " + dataCount + " data items, " +
-             keyCount + " wrapped keys - originals deleted, only _BACKUP exists");
+             keyCount + " wrapped keys, " + espCount + " ESP items - originals deleted, only _BACKUP exists");
     }
 
     /**
@@ -112,7 +176,27 @@ public class MigrationBackup {
                                    SharedPreferences configSource,
                                    FlutterSecureStorageConfig config,
                                    String keyPrefix) {
-        deleteBackupData(dataSource, keyStorage, keyPrefix);
+        deleteBackup(dataSource, keyStorage, null, configSource, config, keyPrefix);
+    }
+
+    /**
+     * Deletes all _BACKUP entries from storage, including ESP.
+     * Sets backup status to "deleted" in configSource.
+     *
+     * @param dataSource SharedPreferences containing user data
+     * @param keyStorage SharedPreferences containing wrapped keys
+     * @param espSource EncryptedSharedPreferences source (can be null)
+     * @param configSource SharedPreferences for status tracking
+     * @param config Configuration object
+     * @param keyPrefix Prefix to filter data keys
+     */
+    public static void deleteBackup(SharedPreferences dataSource,
+                                   SharedPreferences keyStorage,
+                                   SharedPreferences espSource,
+                                   SharedPreferences configSource,
+                                   FlutterSecureStorageConfig config,
+                                   String keyPrefix) {
+        deleteBackupData(dataSource, keyStorage, espSource, keyPrefix);
 
         // Mark backup as deleted
         setBackupStatus(configSource, config, STATUS_DELETED);
@@ -172,8 +256,33 @@ public class MigrationBackup {
     private static void deleteBackupData(SharedPreferences dataSource,
                                         SharedPreferences keyStorage,
                                         String keyPrefix) {
+        deleteBackupData(dataSource, keyStorage, null, keyPrefix);
+    }
+
+    /**
+     * Deletes _BACKUP entries from storage, including ESP (without updating status).
+     * Internal helper method.
+     */
+    private static void deleteBackupData(SharedPreferences dataSource,
+                                        SharedPreferences keyStorage,
+                                        SharedPreferences espSource,
+                                        String keyPrefix) {
         int dataCount = 0;
         int keyCount = 0;
+        int espCount = 0;
+
+        // Delete _BACKUP keys from ESP if provided
+        if (espSource != null) {
+            SharedPreferences.Editor espEditor = espSource.edit();
+            for (Map.Entry<String, ?> entry : espSource.getAll().entrySet()) {
+                String key = entry.getKey();
+                if (key.endsWith(BACKUP_SUFFIX) && key.contains(keyPrefix)) {
+                    espEditor.remove(key);
+                    espCount++;
+                }
+            }
+            espEditor.commit();
+        }
 
         // Delete _BACKUP keys from dataSource
         SharedPreferences.Editor dataEditor = dataSource.edit();
@@ -197,8 +306,8 @@ public class MigrationBackup {
         }
         keyEditor.commit();
 
-        if (dataCount > 0 || keyCount > 0) {
-            Log.d(TAG, "Deleted " + dataCount + " data _BACKUP entries, " + keyCount + " key _BACKUP entries");
+        if (dataCount > 0 || keyCount > 0 || espCount > 0) {
+            Log.d(TAG, "Deleted " + dataCount + " data _BACKUP entries, " + keyCount + " key _BACKUP entries, " + espCount + " ESP _BACKUP entries");
         }
     }
 

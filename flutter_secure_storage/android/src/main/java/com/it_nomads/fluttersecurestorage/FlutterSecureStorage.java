@@ -185,17 +185,7 @@ public class FlutterSecureStorage {
 
         Boolean isAlreadyMigrated = getEncryptedPrefsMigrated(configSource);
 
-        // ESP to custom migration - enabled only with backup protection
-        // Migrations are disabled unless explicitly enabled via migrateWithBackup flag
-        // Recovery mode handles both ESP and custom cipher data without migration
-        if (!config.shouldMigrateWithBackup()) {
-            Log.i(TAG, "ESP to custom migration is DISABLED (migrateWithBackup=false)");
-            Log.i(TAG, "Enable migrateWithBackup=true to run migrations with backup protection");
-            Log.i(TAG, "Use recovery mode to access ESP-encrypted data if needed");
-        }
-
-        // Run ESP migration only if backup protection is enabled
-        if (config.shouldMigrateWithBackup() && !isAlreadyMigrated) {
+        if (!isAlreadyMigrated) {
             try {
                 SharedPreferences encryptedPreferences = initializeEncryptedSharedPreferencesManager(context);
 
@@ -1186,10 +1176,54 @@ public class FlutterSecureStorage {
     }
 
     /**
+     * Migrates data from EncryptedSharedPreferences to custom cipher storage WITH backup protection.
+     * This is a simpler migration since ESP data is already encrypted by Tink.
+     * We just copy ESP keys → custom cipher without creating backups (ESP encryption is the backup).
+     */
+    private void migrateESPWithBackup(SharedPreferences espSource, SharedPreferences target,
+                                      SharedPreferences configSource, SecurePreferencesCallback<Void> callback) {
+        Log.i(TAG, "Starting ESP→custom cipher migration WITH backup protection...");
+
+        // Initialize custom cipher for migration target
+        initializeStorageCipher(configSource, new SecurePreferencesCallback<>() {
+            @Override
+            public void onSuccess(Void unused) {
+                try {
+                    // Migrate ESP data to custom cipher
+                    migrateFromEncryptedSharedPreferences(espSource, target);
+                    preferences = target;
+                    Log.i(TAG, "ESP migration completed successfully. Now using custom cipher storage.");
+                    setEncryptedPrefsMigrated(configSource);
+                    callback.onSuccess(null);
+                } catch (Exception e) {
+                    Log.e(TAG, "ESP migration failed. Falling back to ESP.", e);
+                    preferences = espSource;
+                    callback.onSuccess(null);
+                }
+            }
+
+            @Override
+            public void onError(Exception e) {
+                Log.e(TAG, "Cipher initialization failed during ESP migration. Using ESP.", e);
+                preferences = espSource;
+                callback.onSuccess(null);
+            }
+        });
+    }
+
+    /**
      * Migrates data from EncryptedSharedPreferences to custom cipher storage.
      * Data is read from ESP (plaintext after ESP decryption), then encrypted with custom cipher.
      */
     private void migrateFromEncryptedSharedPreferences(SharedPreferences source, SharedPreferences target) throws Exception {
+        migrateFromEncryptedSharedPreferences(source, target, storageCipher);
+    }
+
+    /**
+     * Migrates data from EncryptedSharedPreferences to custom cipher storage using specified cipher.
+     * Data is read from ESP (plaintext after ESP decryption), then encrypted with custom cipher.
+     */
+    private void migrateFromEncryptedSharedPreferences(SharedPreferences source, SharedPreferences target, StorageCipher cipher) throws Exception {
         int migratedCount = 0;
 
         for (Map.Entry<String, ?> entry : source.getAll().entrySet()) {
@@ -1197,7 +1231,7 @@ public class FlutterSecureStorage {
             String key = entry.getKey();
 
             if (v instanceof String plainValue && key.contains(config.getSharedPreferencesKeyPrefix())) {
-                byte[] encrypted = storageCipher.encrypt(plainValue.getBytes(charset));
+                byte[] encrypted = cipher.encrypt(plainValue.getBytes(charset));
                 String baseEncoded = Base64.encodeToString(encrypted, 0);
                 target.edit().putString(key, baseEncoded).apply();
 
@@ -1309,6 +1343,14 @@ public class FlutterSecureStorage {
                 "RSA_ECB_OAEPwithSHA_256andMGF1Padding",
                 "AES_GCM_NoPadding",
                 false),  // Try custom cipher ONLY
+            new CipherAlgorithm("HYBRID_OAEP_CBC",
+                "RSA_ECB_OAEPwithSHA_256andMGF1Padding",
+                "AES_CBC_PKCS7Padding",
+                false),  // HYBRID: v6.7.0 RSA key wrapping + v5.3.1 AES storage
+            new CipherAlgorithm("HYBRID_PKCS1_GCM",
+                "RSA_ECB_PKCS1Padding",
+                "AES_GCM_NoPadding",
+                false),  // HYBRID: v5.3.1 RSA key wrapping + v6.7.0 AES storage
             new CipherAlgorithm("v5.3.1_CUSTOM",
                 "RSA_ECB_PKCS1Padding",
                 "AES_CBC_PKCS7Padding",
@@ -1505,8 +1547,24 @@ public class FlutterSecureStorage {
                     continue;
                 }
 
+                // Log Base64 string before decoding
+                debugLog.append("  [DEBUG] ").append(actualKey)
+                         .append(": Base64 len=").append(rawValue.length())
+                         .append(", first50=").append(rawValue.substring(0, Math.min(50, rawValue.length())))
+                         .append("\n");
+
                 // Decrypt with this cipher
                 byte[] encryptedData = Base64.decode(rawValue, 0);
+
+                // Log decoded bytes (IV + payload structure)
+                debugLog.append("  [DEBUG] ").append(actualKey)
+                         .append(": Decoded len=").append(encryptedData.length)
+                         .append(", hex=").append(toHex(encryptedData, 32))
+                         .append(", ivLen=16")
+                         .append(", payloadLen=").append(encryptedData.length - 16)
+                         .append(", isBlockAligned=").append((encryptedData.length - 16) % 16 == 0)
+                         .append("\n");
+
                 byte[] decryptedBytes = storageCipher.decrypt(encryptedData);
                 String decrypted = new String(decryptedBytes, charset);
 
@@ -1518,7 +1576,11 @@ public class FlutterSecureStorage {
             } catch (Exception e) {
                 // Key failed to decrypt with this cipher - continue to next key
                 String errorType = e.getClass().getSimpleName();
-                debugLog.append("  [FAIL] ").append(actualKey).append(": ").append(errorType).append("\n");
+                String errorMsg = e.getMessage() != null ? e.getMessage() : "";
+                debugLog.append("  [FAIL] ").append(actualKey)
+                         .append(": ").append(errorType)
+                         .append(" - ").append(errorMsg)
+                         .append("\n");
             }
         }
 
@@ -1601,17 +1663,6 @@ public class FlutterSecureStorage {
                 SharedPreferences keyStorage = context.getSharedPreferences(
                     "FlutterSecureKeyStorage", Context.MODE_PRIVATE);
 
-                // TESTING: Get current test step for systematic failure testing
-                int currentTestStep = MigrationBackup.getMigrationTestStep(configSource);
-                Log.i(TAG, "=".repeat(60));
-                Log.i(TAG, "MIGRATION TESTING MODE: Current step = " + currentTestStep);
-                if (currentTestStep == -1) {
-                    Log.i(TAG, "All steps tested successfully - running normal migration");
-                } else {
-                    Log.i(TAG, "Will FAIL at step " + currentTestStep + " for testing");
-                }
-                Log.i(TAG, "=".repeat(60));
-
                 // Step 0: Check if backup status is "complete" - skip backup if already done
                 String backupStatus = MigrationBackup.getBackupStatus(configSource, config);
                 if (MigrationBackup.STATUS_COMPLETE.equals(backupStatus)) {
@@ -1628,56 +1679,29 @@ public class FlutterSecureStorage {
                             config.getSharedPreferencesKeyPrefix()
                         );
                         Log.i(TAG, "Backup complete - originals deleted, only _BACKUP keys exist");
-
-                        // TESTING: Inject failure at step 1
-                        if (currentTestStep == 1) {
-                            String error = "TEST FAILURE at Step 1: After backup creation";
-                            MigrationBackup.recordMigrationError(configSource, 1, error);
-                            throw new Exception(error);
-                        }
                     } else {
                         Log.i(TAG, "No algorithm change detected, skipping backup");
                     }
                 }
-    
+
                 // Step 2: Initialize old cipher FROM BACKUP keys
                 Log.d(TAG, "Step 2/7: Initializing saved cipher from _BACKUP keys...");
                 StorageCipher savedCipher = storageCipherFactory.getSavedStorageCipher(context, null);
 
-                // TESTING: Inject failure at step 2
-                if (currentTestStep == 2) {
-                    String error = "TEST FAILURE at Step 2: After cipher initialization";
-                    MigrationBackup.recordMigrationError(configSource, 2, error);
-                    throw new Exception(error);
-                }
-
                 // Step 3: Decrypt all data FROM BACKUP (in memory only)
                 Log.d(TAG, "Step 3/7: Decrypting all data from _BACKUP keys...");
-                Map<String, String> decryptedCache = decryptAllWithSavedCipherFromBackup(dataSource, savedCipher);
+                Map<String, String> decryptedCache = decryptAllWithSavedCipherFromBackup(dataSource, null, savedCipher);
+                Log.d(TAG, "Successfully decrypted " + decryptedCache.size() + " items from _BACKUP keys");
 
-                // TESTING: Inject failure at step 3
-                if (currentTestStep == 3) {
-                    String error = "TEST FAILURE at Step 3: After decryption";
-                    MigrationBackup.recordMigrationError(configSource, 3, error);
-                    throw new Exception(error);
-                }
-    
                 if (decryptedCache.isEmpty()) {
                     Log.i(TAG, "No data found in _BACKUP keys to migrate");
                 } else {
                     Log.i(TAG, "Found " + decryptedCache.size() + " items to migrate from _BACKUP keys");
                 }
-    
+
                 // Step 4: Create new cipher (NEW algorithm)
                 Log.d(TAG, "Step 4/7: Initializing current cipher with new algorithm...");
                 StorageCipher currentCipher = storageCipherFactory.getCurrentStorageCipher(context, null);
-
-                // TESTING: Inject failure at step 4
-                if (currentTestStep == 4) {
-                    String error = "TEST FAILURE at Step 4: After new cipher creation";
-                    MigrationBackup.recordMigrationError(configSource, 4, error);
-                    throw new Exception(error);
-                }
 
                 if (decryptedCache.isEmpty()) {
                     Log.i(TAG, "Step 5/7: No data to encrypt, skipping...");
@@ -1685,28 +1709,32 @@ public class FlutterSecureStorage {
                     // Step 5: Encrypt all data with NEW cipher
                     Log.d(TAG, "Step 5/7: Encrypting all data with current cipher...");
                     encryptAllWithCurrentCipher(decryptedCache, dataSource, currentCipher);
-
-                    // TESTING: Inject failure at step 5
-                    if (currentTestStep == 5) {
-                        String error = "TEST FAILURE at Step 5: After re-encryption";
-                        MigrationBackup.recordMigrationError(configSource, 5, error);
-                        throw new Exception(error);
-                    }
                 }
 
-                // Step 6: Write NEW encrypted data to dataSource (uses commit())
-                Log.d(TAG, "Step 6/7: New encrypted data written successfully");
+                // Step 6: Migrate ESP data if present (after algorithm migration complete)
+                Log.d(TAG, "Step 6/7: Checking for ESP data to migrate...");
 
-                // TESTING: Inject failure at step 6
-                if (currentTestStep == 6) {
-                    String error = "TEST FAILURE at Step 6: After write to storage";
-                    MigrationBackup.recordMigrationError(configSource, 6, error);
-                    throw new Exception(error);
+                // Check if ESP migration is needed
+                Boolean isESPMigrated = getEncryptedPrefsMigrated(configSource);
+                if (!isESPMigrated) {
+                    try {
+                        SharedPreferences encryptedPreferences = initializeEncryptedSharedPreferencesManager(context);
+                        if (hasDataInEncryptedSharedPreferences(encryptedPreferences)) {
+                            Log.i(TAG, "Found ESP data - migrating to custom cipher storage...");
+                            migrateFromEncryptedSharedPreferences(encryptedPreferences, dataSource, currentCipher);
+                            setEncryptedPrefsMigrated(configSource);
+                            Log.i(TAG, "ESP migration completed successfully");
+                        } else {
+                            Log.d(TAG, "No ESP data found");
+                        }
+                    } catch (Exception espError) {
+                        Log.w(TAG, "ESP migration failed or ESP not available: " + espError.getMessage());
+                    }
                 }
     
                 // Step 7: SUCCESS! Now safe to clean up
                 Log.d(TAG, "Step 7/7: Cleaning up - deleting _BACKUP, updating markers, deleting old keys...");
-    
+
                 // Delete all _BACKUP entries
                 MigrationBackup.deleteBackup(dataSource, keyStorage, configSource, config,
                                             config.getSharedPreferencesKeyPrefix());
@@ -1732,71 +1760,73 @@ public class FlutterSecureStorage {
                 Log.i(TAG, "Non-biometric migration WITH BACKUP completed successfully!");
                 Log.i(TAG, "Migrated " + decryptedCache.size() + " data items with new algorithm.");
 
-                // TESTING: Increment test step on successful completion
-                if (currentTestStep != -1) {
-                    int nextStep = MigrationBackup.incrementMigrationTestStep(configSource, 6);
-                    Log.i(TAG, "=".repeat(60));
-                    Log.i(TAG, "MIGRATION TEST: Step " + currentTestStep + " completed successfully");
-                    if (nextStep == -1) {
-                        Log.i(TAG, "MIGRATION TEST: ALL STEPS TESTED! Migration will run normally from now on.");
-                    } else {
-                        Log.i(TAG, "MIGRATION TEST: Next step will be " + nextStep);
-                    }
-                    Log.i(TAG, "=".repeat(60));
-                }
-
                 callback.onSuccess(null);
 
             } catch (Exception e) {
                 Log.e(TAG, "Non-biometric migration with backup failed", e);
-
-                // TESTING: On failure, increment step for next attempt
-                int testStep = MigrationBackup.getMigrationTestStep(configSource);
-                if (testStep != -1) {
-                    int nextStep = MigrationBackup.incrementMigrationTestStep(configSource, 6);
-                    Log.i(TAG, "=".repeat(60));
-                    Log.i(TAG, "MIGRATION TEST: Step " + testStep + " failed as expected");
-                    if (nextStep == -1) {
-                        Log.i(TAG, "MIGRATION TEST: ALL FAILURE POINTS TESTED!");
-                    } else {
-                        Log.i(TAG, "MIGRATION TEST: Next restart will test step " + nextStep);
-                    }
-                    Log.i(TAG, "=".repeat(60));
-                }
-
                 callback.onError(new Exception("Non-biometric migration with backup failed", e));
             }
         }
         private Map<String, String> decryptAllWithSavedCipherFromBackup(SharedPreferences dataSource,
+                                                                         SharedPreferences espSource,
                                                                          StorageCipher savedStorageCipher) throws Exception {
             Map<String, String> decryptedCache = new HashMap<>();
-            int count = 0;
-    
+            int encryptedCount = 0;
+            int espCount = 0;
+
+            // Decrypt ESP _BACKUP keys if ESP source provided
+            if (espSource != null) {
+                try {
+                    for (Map.Entry<String, ?> entry : espSource.getAll().entrySet()) {
+                        String key = entry.getKey();
+                        Object value = entry.getValue();
+
+                        // Only process _BACKUP keys
+                        if (value instanceof String && key.contains(config.getSharedPreferencesKeyPrefix())
+                            && key.endsWith("_BACKUP")) {
+                            String stringValue = (String) value;
+                            String originalKey = key.substring(0, key.length() - "_BACKUP".length());
+
+                            // ESP data is already decrypted by ESP (Tink library)
+                            // No need to decrypt again - just use the value directly
+                            decryptedCache.put(originalKey, stringValue);
+                            espCount++;
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed to read ESP _BACKUP keys: " + e.getMessage());
+                    // Continue with regular backup keys
+                }
+            }
+
+            // Decrypt regular _BACKUP keys from dataSource
             for (Map.Entry<String, ?> entry : dataSource.getAll().entrySet()) {
                 String key = entry.getKey();
                 Object value = entry.getValue();
-    
+
                 // Only process _BACKUP keys
                 if (value instanceof String && key.contains(config.getSharedPreferencesKeyPrefix())
                     && key.endsWith("_BACKUP")) {
+                    String stringValue = (String) value;
+                    String originalKey = key.substring(0, key.length() - "_BACKUP".length());
+
                     try {
-                        // Decode and decrypt with old cipher
-                        byte[] encryptedData = Base64.decode((String) value, 0);
+                        // Decode Base64 and decrypt with saved cipher
+                        byte[] encryptedData = Base64.decode(stringValue, 0);
                         byte[] decryptedData = savedStorageCipher.decrypt(encryptedData);
                         String plainValue = new String(decryptedData, charset);
-    
-                        // Store with original key name (without _BACKUP suffix)
-                        String originalKey = key.substring(0, key.length() - "_BACKUP".length());
+
                         decryptedCache.put(originalKey, plainValue);
-                        count++;
-                    } catch (Exception e) {
-                        Log.e(TAG, "Failed to decrypt _BACKUP key: " + key, e);
-                        throw new Exception("Failed to decrypt existing data from backup for key: " + key, e);
+                        encryptedCount++;
+                    } catch (Exception decryptError) {
+                        Log.e(TAG, "Failed to decrypt _BACKUP key: " + key, decryptError);
+                        throw new Exception("Failed to decrypt existing data from backup for key: " + key, decryptError);
                     }
                 }
             }
-    
-            Log.d(TAG, "Successfully decrypted " + count + " items from _BACKUP keys");
+
+            Log.d(TAG, "Successfully processed " + (encryptedCount + espCount) + " items from _BACKUP keys (" +
+                  encryptedCount + " encrypted, " + espCount + " ESP)");
             return decryptedCache;
         }
         private void migrateFromBiometricToNonBiometricWithBackup(SharedPreferences configSource, SharedPreferences dataSource,
@@ -1838,7 +1868,7 @@ public class FlutterSecureStorage {
                             // Step 2: Decrypt with OLD biometric cipher FROM BACKUP
                             Log.d(TAG, "Step 2/7: Decrypting all data from _BACKUP with saved biometric cipher...");
                             StorageCipher savedCipher = storageCipherFactory.getSavedStorageCipher(context, oldKeyCipher);
-                            Map<String, String> decryptedCache = decryptAllWithSavedCipherFromBackup(dataSource, savedCipher);
+                            Map<String, String> decryptedCache = decryptAllWithSavedCipherFromBackup(dataSource, null, savedCipher);
     
                             // Step 3: Get NEW non-biometric cipher (no auth)
                             Log.d(TAG, "Step 3/7: Initializing current non-biometric cipher...");
@@ -1914,7 +1944,7 @@ public class FlutterSecureStorage {
                 // Step 1: Decrypt with OLD non-biometric cipher FROM BACKUP (no auth)
                 Log.d(TAG, "Step 1/7: Decrypting all data from _BACKUP with saved non-biometric cipher...");
                 StorageCipher savedCipher = storageCipherFactory.getSavedStorageCipher(context, null);
-                Map<String, String> decryptedCache = decryptAllWithSavedCipherFromBackup(dataSource, savedCipher);
+                Map<String, String> decryptedCache = decryptAllWithSavedCipherFromBackup(dataSource, null, savedCipher);
     
                 // Step 2: Get NEW biometric cipher (requires authentication)
                 Log.d(TAG, "Step 2/7: Getting current biometric cipher...");
@@ -2023,7 +2053,7 @@ public class FlutterSecureStorage {
                             // Step 2: Decrypt with OLD biometric cipher FROM BACKUP
                             Log.d(TAG, "Step 2/8: Decrypting all data from _BACKUP with saved biometric cipher...");
                             StorageCipher savedCipher = storageCipherFactory.getSavedStorageCipher(context, oldCipher);
-                            Map<String, String> decryptedCache = decryptAllWithSavedCipherFromBackup(dataSource, savedCipher);
+                            Map<String, String> decryptedCache = decryptAllWithSavedCipherFromBackup(dataSource, null, savedCipher);
     
                             if (decryptedCache.isEmpty()) {
                                 Log.i(TAG, "No data found in _BACKUP keys to migrate");
@@ -2117,6 +2147,16 @@ public class FlutterSecureStorage {
             }
         }
 
+    /**
+     * Converts byte array to hexadecimal string for debugging.
+     */
+    private static String toHex(byte[] bytes, int limit) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < Math.min(bytes.length, limit); i++) {
+            sb.append(String.format("%02x", bytes[i]));
+        }
+        return sb.toString();
+    }
 
     /**
      * Helper class to represent a cipher algorithm configuration.
