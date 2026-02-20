@@ -48,6 +48,24 @@ public class StorageCipherImplementationAES18 implements StorageCipher {
         editor.apply();
     }
 
+    /**
+     * Read-only constructor: unwraps the AES key from the provided Base64-encoded blob
+     * without reading from or writing to SharedPreferences.
+     * Used by recovery mode to try specific key blobs (including _BACKUP blobs) without
+     * modifying persistent storage.
+     *
+     * @param rsaCipher         The RSA key cipher to use for unwrapping
+     * @param ignoredCipher     Ignored (kept for consistent signature)
+     * @param wrappedKeyBase64  Base64-encoded wrapped AES key blob to unwrap
+     * @throws Exception if unwrap fails (wrong algorithm, corrupted blob, etc.)
+     */
+    StorageCipherImplementationAES18(KeyCipher rsaCipher, Cipher ignoredCipher, String wrappedKeyBase64) throws Exception {
+        secureRandom = new SecureRandom();
+        cipher = getCipher();
+        byte[] encrypted = Base64.decode(wrappedKeyBase64, Base64.DEFAULT);
+        secretKey = rsaCipher.unwrap(encrypted, KEY_ALGORITHM);
+    }
+
     @Override
     public void deleteKey(Context context) {
         SharedPreferences preferences = context.getSharedPreferences(SHARED_PREFERENCES_NAME, Context.MODE_PRIVATE);

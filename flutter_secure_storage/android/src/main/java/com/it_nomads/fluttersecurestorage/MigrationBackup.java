@@ -13,10 +13,7 @@ public class MigrationBackup {
     private static final String TAG = "MigrationBackup";
     private static final String BACKUP_STATUS_KEY = "FlutterSecureStorageBackupStatus";
     private static final String BACKUP_SUFFIX = "_BACKUP";
-
-    // TESTING: Migration step tracking
-    private static final String MIGRATION_STEP_KEY = "FlutterSecureStorage_Migration_Test_Step";
-    private static final String MIGRATION_LAST_ERROR_KEY = "FlutterSecureStorage_Migration_Last_Error";
+    private static final String MIGRATED_SUFFIX = "_MIGRATED";  // stored in configSource, not dataSource
 
     public static final String STATUS_STARTED = "started";
     public static final String STATUS_COMPLETE = "complete";
@@ -136,29 +133,10 @@ public class MigrationBackup {
         }
 
         // Step 3: Mark backup as complete (critical safety point)
+        // Originals are kept - they will be deleted in step 7 after successful migration
         setBackupStatus(configSource, config, STATUS_COMPLETE);
-        Log.i(TAG, "Backup marked complete - original data still exists");
-
-        // Step 4: Now safe to delete originals (rename operation)
-        deleteOriginalData(dataSource, keyStorage, keyPrefix);
-
-        // Step 5: Delete original ESP keys (keep _BACKUP ones)
-        if (espSource != null && espCount > 0) {
-            Log.i(TAG, "Deleting original ESP keys (keeping _BACKUP)...");
-            SharedPreferences.Editor espEditor = espSource.edit();
-            for (Map.Entry<String, ?> entry : espSource.getAll().entrySet()) {
-                String key = entry.getKey();
-                // Delete original keys, keep _BACKUP keys
-                if (key.contains(keyPrefix) && !key.endsWith(BACKUP_SUFFIX)) {
-                    espEditor.remove(key);
-                }
-            }
-            espEditor.commit();
-            Log.i(TAG, "Original ESP keys deleted (renamed to _BACKUP)");
-        }
-
-        Log.i(TAG, "Backup created (rename complete): " + dataCount + " data items, " +
-             keyCount + " wrapped keys, " + espCount + " ESP items - originals deleted, only _BACKUP exists");
+        Log.i(TAG, "Backup complete: " + dataCount + " data items, " +
+             keyCount + " wrapped keys, " + espCount + " ESP items - originals preserved until migration succeeds");
     }
 
     /**
@@ -198,10 +176,10 @@ public class MigrationBackup {
                                    String keyPrefix) {
         deleteBackupData(dataSource, keyStorage, espSource, keyPrefix);
 
-        // Mark backup as deleted
-        setBackupStatus(configSource, config, STATUS_DELETED);
+        // Remove backup status key entirely — migration is complete, no trace needed
+        configSource.edit().remove(BACKUP_STATUS_KEY).commit();
 
-        Log.d(TAG, "Backup deleted and marked as deleted");
+        Log.d(TAG, "Backup deleted and status key removed");
     }
 
     /**
@@ -312,112 +290,123 @@ public class MigrationBackup {
     }
 
     /**
-     * Deletes original (non-_BACKUP) entries from storage.
-     * This completes the rename operation after backup is marked complete.
-     * Internal helper method.
+     * Deletes original (non-_BACKUP) entries from dataSource and keyStorage.
+     * Called after successful decryption from _BACKUP keys, before re-encryption.
+     * RSA KeyStore keys are NOT deleted here - they are deleted at step 7.
+     *
+     * @param dataSource SharedPreferences containing user data
+     * @param keyStorage SharedPreferences containing wrapped AES keys
+     * @param keyPrefix Prefix to filter data keys
      */
-    private static void deleteOriginalData(SharedPreferences dataSource,
+    public static void deleteOriginalData(SharedPreferences dataSource,
                                           SharedPreferences keyStorage,
                                           String keyPrefix) {
+        deleteOriginalData(dataSource, keyStorage, null, keyPrefix);
+    }
+
+    /**
+     * Deletes original (non-_BACKUP) entries from dataSource and keyStorage,
+     * preserving any data key that already has a <key>_MIGRATED marker in configSource.
+     * A _MIGRATED marker means that key was already successfully re-encrypted with the
+     * new cipher on a previous (crashed) run — deleting it would cause data loss on retry.
+     *
+     * @param dataSource SharedPreferences containing user data
+     * @param keyStorage SharedPreferences containing wrapped AES keys
+     * @param configSource SharedPreferences for migration tracking (may be null to skip check)
+     * @param keyPrefix Prefix to filter data keys
+     */
+    public static void deleteOriginalData(SharedPreferences dataSource,
+                                          SharedPreferences keyStorage,
+                                          SharedPreferences configSource,
+                                          String keyPrefix) {
         int dataCount = 0;
+        int preservedCount = 0;
         int keyCount = 0;
 
-        // Delete original keys from dataSource
+        // Delete original keys from dataSource, except those already _MIGRATED
         SharedPreferences.Editor dataEditor = dataSource.edit();
         for (Map.Entry<String, ?> entry : dataSource.getAll().entrySet()) {
             String key = entry.getKey();
             if (!key.endsWith(BACKUP_SUFFIX) && key.contains(keyPrefix)) {
+                if (configSource != null && configSource.contains(key + MIGRATED_SUFFIX)) {
+                    // This key was already re-encrypted on a prior (crashed) run — preserve it
+                    Log.d(TAG, "Preserving already-migrated key in dataSource: " + key);
+                    preservedCount++;
+                    continue;
+                }
                 dataEditor.remove(key);
                 dataCount++;
             }
         }
         dataEditor.commit();
 
-        // Delete original keys from keyStorage
-        SharedPreferences.Editor keyEditor = keyStorage.edit();
-        for (Map.Entry<String, ?> entry : keyStorage.getAll().entrySet()) {
+        // Delete original keys from keyStorage — but only if no _MIGRATED markers exist.
+        // If _MIGRATED markers exist, step 5 already ran in a prior crashed run and wrote the new
+        // wrapped AES key to keyStorage. Deleting it now would cause BAD_DECRYPT because step 5
+        // will skip those keys (they're already migrated) and never rewrite the key.
+        if (preservedCount == 0) {
+            // No already-migrated keys — safe to delete keyStorage originals
+            SharedPreferences.Editor keyEditor = keyStorage.edit();
+            for (Map.Entry<String, ?> entry : keyStorage.getAll().entrySet()) {
+                String key = entry.getKey();
+                if (!key.endsWith(BACKUP_SUFFIX)) {
+                    keyEditor.remove(key);
+                    keyCount++;
+                }
+            }
+            keyEditor.commit();
+        } else {
+            // Some keys were already migrated in a prior run — the new wrapped AES key is in
+            // keyStorage and must be preserved. Step 5 will skip those keys and won't rewrite it.
+            Log.d(TAG, "Preserving keyStorage originals (new wrapped AES key) — already-migrated keys exist");
+        }
+
+        Log.d(TAG, "Deleted " + dataCount + " original data entries (preserved " + preservedCount + " already-migrated), " + keyCount + " original key entries");
+    }
+
+    /**
+     * Returns true if any _MIGRATED markers exist in configSource for the given keyPrefix.
+     * Used to detect whether step 5 has run (at least partially) in a prior crashed run.
+     * If true, step 2 must NOT restore _BACKUP key blobs — the new wrapped AES key is already
+     * in keyStorage (written when getCurrentStorageCipher was initialized at step 4/5) and must
+     * not be overwritten with the old _BACKUP version.
+     *
+     * @param configSource SharedPreferences used for migration status tracking
+     * @param keyPrefix Prefix to filter marker keys
+     * @return true if at least one _MIGRATED marker exists
+     */
+    public static boolean hasMigratedMarkers(SharedPreferences configSource, String keyPrefix) {
+        for (Map.Entry<String, ?> entry : configSource.getAll().entrySet()) {
             String key = entry.getKey();
-            if (!key.endsWith(BACKUP_SUFFIX)) {
-                keyEditor.remove(key);
-                keyCount++;
+            if (key.endsWith(MIGRATED_SUFFIX) && key.contains(keyPrefix)) {
+                return true;
             }
         }
-        keyEditor.commit();
-
-        Log.d(TAG, "Deleted " + dataCount + " original data entries, " + keyCount + " original key entries");
-    }
-
-    // ============================================================================
-    // TESTING: Migration Step Tracking for Systematic Failure Testing
-    // ============================================================================
-
-    /**
-     * Gets the current migration test step number.
-     * Used for systematic testing of migration failures at each step.
-     * @param configSource SharedPreferences for storing step number
-     * @return Current step number (0-7), or -1 if testing complete
-     */
-    public static int getMigrationTestStep(SharedPreferences configSource) {
-        return configSource.getInt(MIGRATION_STEP_KEY, 0);
+        return false;
     }
 
     /**
-     * Sets the current migration test step number.
-     * @param configSource SharedPreferences for storing step number
-     * @param step Step number (0-7), or -1 to mark testing complete
+     * Deletes all _MIGRATED marker entries from configSource.
+     * Markers are stored in configSource (not dataSource) to keep them isolated from real user data.
+     * Called during step 7 cleanup after all keys have been successfully re-encrypted.
+     *
+     * @param configSource SharedPreferences used for migration status tracking
+     * @param keyPrefix Prefix to filter marker keys (matches the prefix used when writing markers)
      */
-    public static void setMigrationTestStep(SharedPreferences configSource, int step) {
+    public static void deleteMigratedMarkers(SharedPreferences configSource, String keyPrefix) {
         SharedPreferences.Editor editor = configSource.edit();
-        editor.putInt(MIGRATION_STEP_KEY, step);
+        int count = 0;
+        for (Map.Entry<String, ?> entry : configSource.getAll().entrySet()) {
+            String key = entry.getKey();
+            if (key.endsWith(MIGRATED_SUFFIX) && key.contains(keyPrefix)) {
+                editor.remove(key);
+                count++;
+            }
+        }
         editor.commit();
-        Log.i(TAG, "Migration test step set to: " + step);
+        if (count > 0) {
+            Log.d(TAG, "Deleted " + count + " _MIGRATED marker entries from configSource");
+        }
     }
 
-    /**
-     * Increments the migration test step and returns the new value.
-     * If step reaches max (7), sets to -1 to indicate testing complete.
-     * @param configSource SharedPreferences for storing step number
-     * @param maxStep Maximum step number (usually 7)
-     * @return New step number, or -1 if testing complete
-     */
-    public static int incrementMigrationTestStep(SharedPreferences configSource, int maxStep) {
-        int currentStep = getMigrationTestStep(configSource);
-        int nextStep = currentStep >= maxStep ? -1 : currentStep + 1;
-        setMigrationTestStep(configSource, nextStep);
-        return nextStep;
-    }
-
-    /**
-     * Records the last migration error for diagnostic purposes.
-     * @param configSource SharedPreferences for storing error
-     * @param step Step number where error occurred
-     * @param error Error message
-     */
-    public static void recordMigrationError(SharedPreferences configSource, int step, String error) {
-        SharedPreferences.Editor editor = configSource.edit();
-        editor.putString(MIGRATION_LAST_ERROR_KEY, "Step " + step + ": " + error);
-        editor.commit();
-        Log.e(TAG, "Recorded migration error at step " + step + ": " + error);
-    }
-
-    /**
-     * Gets the last recorded migration error.
-     * @param configSource SharedPreferences for storing error
-     * @return Last error message, or null if none
-     */
-    public static String getLastMigrationError(SharedPreferences configSource) {
-        return configSource.getString(MIGRATION_LAST_ERROR_KEY, null);
-    }
-
-    /**
-     * Resets migration testing state.
-     * @param configSource SharedPreferences for storing state
-     */
-    public static void resetMigrationTesting(SharedPreferences configSource) {
-        SharedPreferences.Editor editor = configSource.edit();
-        editor.remove(MIGRATION_STEP_KEY);
-        editor.remove(MIGRATION_LAST_ERROR_KEY);
-        editor.commit();
-        Log.i(TAG, "Migration testing state reset");
-    }
 }

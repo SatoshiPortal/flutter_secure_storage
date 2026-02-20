@@ -47,11 +47,10 @@ public class StorageCipherFactory {
         final KeyCipherAlgorithm currentKeyAlgorithmTmp = KeyCipherAlgorithm.fromString(keyCipherAlgorithm);
         currentKeyAlgorithm = (currentKeyAlgorithmTmp.minVersionCode <= Build.VERSION.SDK_INT) ? currentKeyAlgorithmTmp : DEFAULT_KEY_ALGORITHM;
 
-        // Store algorithm markers immediately ONLY if migrateWithBackup is disabled
-        // When migrateWithBackup=true, markers are stored AFTER successful migration (step 7)
-        // to ensure migration can be retried if it fails
         if (savedKeyCipherAlgorithm == null || savedStorageCipherAlgorithm == null) {
-            if (!config.shouldMigrateWithBackup()) {
+            // Don't write algorithm markers during recovery mode (read-only) or during
+            // migrateWithBackup (the migration flow writes them at step 7 after success).
+            if (!config.shouldMigrateWithBackup() && !config.isRecoveryMode()) {
                 final SharedPreferences.Editor source = configSource.edit();
                 storeCurrentAlgorithms(source);
                 source.apply();
@@ -75,6 +74,44 @@ public class StorageCipherFactory {
     public StorageCipher getCurrentStorageCipher(Context context, Cipher cipher) throws Exception {
         final KeyCipher keyCipher = currentKeyAlgorithm.keyCipher.apply(context, config);
         return createStorageCipher(context, keyCipher, cipher, currentStorageAlgorithm);
+    }
+
+    /**
+     * Read-only variant: creates a StorageCipher using the provided wrapped key blob directly
+     * instead of reading from SharedPreferences. Does not write to any SharedPreferences.
+     * Used exclusively by recovery mode to try specific key blobs (current or _BACKUP) without
+     * modifying persistent storage.
+     *
+     * @param context          Android context
+     * @param cipher           Cipher instance (may be null for some algorithms)
+     * @param wrappedKeyBase64 Base64-encoded wrapped AES key blob to unwrap
+     * @return StorageCipher initialized with the unwrapped key
+     * @throws Exception if the key blob cannot be unwrapped with the current key algorithm
+     */
+    public StorageCipher getCurrentStorageCipherWithBlob(Context context, Cipher cipher, String wrappedKeyBase64) throws Exception {
+        final KeyCipher keyCipher = currentKeyAlgorithm.keyCipher.apply(context, config);
+        return createStorageCipherWithBlob(keyCipher, cipher, currentStorageAlgorithm, wrappedKeyBase64);
+    }
+
+    /**
+     * Read-only variant of createStorageCipher: uses the provided key blob directly
+     * instead of reading from SharedPreferences. Delegates to read-only constructors
+     * on StorageCipherImplementationGCM / StorageCipherImplementationAES18.
+     */
+    private StorageCipher createStorageCipherWithBlob(KeyCipher keyCipher, Cipher cipher,
+                                                       StorageCipherAlgorithm algorithm,
+                                                       String wrappedKeyBase64) throws Exception {
+        if (algorithm == StorageCipherAlgorithm.AES_GCM_NoPadding) {
+            if (isKeyStoreKeyCipher(keyCipher)) {
+                // Biometric/KeyStore-based: no RSA-wrapped blob, can't use blob-based init
+                throw new Exception("Blob-based init not supported for KeyStore cipher");
+            }
+            return new StorageCipherImplementationGCM(keyCipher, cipher, wrappedKeyBase64);
+        }
+        if (algorithm == StorageCipherAlgorithm.AES_CBC_PKCS7Padding) {
+            return new StorageCipherImplementationAES18(keyCipher, cipher, wrappedKeyBase64);
+        }
+        throw new Exception("Blob-based init not supported for algorithm: " + algorithm.name());
     }
 
     /**
