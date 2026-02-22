@@ -1597,39 +1597,74 @@ public class FlutterSecureStorage {
             debugLog.append("  [KEYBLOB]   - ").append(keyName).append("\n");
         }
 
+        // Known blob names - ALWAYS try BOTH for each algorithm
+        final String GCM_BLOB_NAME = "AESVGhpcyBpcyB0aGUga2V5IGZvciBhIHNlY3VyZSBzdG9yYWdlIEFFUyBLZXkK";
+        final String CBC_BLOB_NAME = "VGhpcyBpcyB0aGUga2V5IGZvciBhIHNlY3VyZSBzdG9yYWdlIEFFUyBLZXkK";
+        final String[] KNOWN_BLOB_NAMES = { GCM_BLOB_NAME, CBC_BLOB_NAME };
+
         StorageCipher storageCipher = null;
-        // Pass 1: current (non-_BACKUP) blobs
-        debugLog.append("  [KEYBLOB] Pass 1: Trying current (non-_BACKUP) blobs...\n");
-        for (Map.Entry<String, String> blobEntry : keyBlobs.entrySet()) {
-            if (!blobEntry.getKey().endsWith("_BACKUP")) {
+
+        // Pass 1: Try both known blob names (current versions)
+        debugLog.append("  [KEYBLOB] Pass 1: Trying known blob names (current)...\n");
+        for (String blobName : KNOWN_BLOB_NAMES) {
+            String blobValue = keyBlobs.get(blobName);
+            if (blobValue != null) {
                 try {
-                    debugLog.append("  [KEYBLOB] Trying blob: ").append(blobEntry.getKey()).append("\n");
-                    storageCipher = factory.getCurrentStorageCipherWithBlob(context, cipher, blobEntry.getValue());
-                    debugLog.append("  [KEYBLOB] ✓ Success with: ").append(blobEntry.getKey()).append("\n");
+                    debugLog.append("  [KEYBLOB] Trying: ").append(blobName).append("\n");
+                    storageCipher = factory.getCurrentStorageCipherWithBlob(context, cipher, blobValue);
+                    debugLog.append("  [KEYBLOB] ✓ Success with: ").append(blobName).append("\n");
                     break;
-                } catch (Exception ignore) {
-                    debugLog.append("  [KEYBLOB] ✗ Failed '").append(blobEntry.getKey())
-                             .append("': ").append(ignore.getMessage()).append("\n");
+                } catch (Exception e) {
+                    debugLog.append("  [KEYBLOB] ✗ Failed '").append(blobName).append("': ").append(e.getMessage()).append("\n");
                 }
             }
         }
-        // Pass 2: _BACKUP blobs (old algorithm)
+
+        // Pass 2: Try both known blob names (_BACKUP versions)
         if (storageCipher == null) {
-            debugLog.append("  [KEYBLOB] Pass 2: Trying _BACKUP blobs...\n");
-            for (Map.Entry<String, String> blobEntry : keyBlobs.entrySet()) {
-                if (blobEntry.getKey().endsWith("_BACKUP")) {
+            debugLog.append("  [KEYBLOB] Pass 2: Trying known blob names (_BACKUP)...\n");
+            for (String blobName : KNOWN_BLOB_NAMES) {
+                String backupBlobName = blobName + "_BACKUP";
+                String blobValue = keyBlobs.get(backupBlobName);
+                if (blobValue != null) {
                     try {
-                        debugLog.append("  [KEYBLOB] Trying backup blob: ").append(blobEntry.getKey()).append("\n");
-                        storageCipher = factory.getCurrentStorageCipherWithBlob(context, cipher, blobEntry.getValue());
-                        debugLog.append("  [KEYBLOB] ✓ Success with backup: ").append(blobEntry.getKey()).append("\n");
+                        debugLog.append("  [KEYBLOB] Trying: ").append(backupBlobName).append("\n");
+                        storageCipher = factory.getCurrentStorageCipherWithBlob(context, cipher, blobValue);
+                        debugLog.append("  [KEYBLOB] ✓ Success with: ").append(backupBlobName).append("\n");
                         break;
-                    } catch (Exception ignore) {
-                        debugLog.append("  [KEYBLOB] ✗ Failed backup '").append(blobEntry.getKey())
-                                 .append("': ").append(ignore.getMessage()).append("\n");
+                    } catch (Exception e) {
+                        debugLog.append("  [KEYBLOB] ✗ Failed '").append(backupBlobName).append("': ").append(e.getMessage()).append("\n");
                     }
                 }
             }
         }
+
+        // Pass 3: Try any other unknown blobs (fallback)
+        if (storageCipher == null) {
+            debugLog.append("  [KEYBLOB] Pass 3: Trying other unknown blobs...\n");
+            for (Map.Entry<String, String> blobEntry : keyBlobs.entrySet()) {
+                String blobName = blobEntry.getKey();
+                // Skip known blobs (already tried)
+                boolean isKnown = false;
+                for (String knownName : KNOWN_BLOB_NAMES) {
+                    if (blobName.equals(knownName) || blobName.equals(knownName + "_BACKUP")) {
+                        isKnown = true;
+                        break;
+                    }
+                }
+                if (isKnown) continue;
+
+                try {
+                    debugLog.append("  [KEYBLOB] Trying: ").append(blobName).append("\n");
+                    storageCipher = factory.getCurrentStorageCipherWithBlob(context, cipher, blobEntry.getValue());
+                    debugLog.append("  [KEYBLOB] ✓ Success with: ").append(blobName).append("\n");
+                    break;
+                } catch (Exception e) {
+                    debugLog.append("  [KEYBLOB] ✗ Failed '").append(blobName).append("': ").append(e.getMessage()).append("\n");
+                }
+            }
+        }
+
         if (storageCipher == null) {
             debugLog.append("  [ERROR] No key blob could be unwrapped for this algorithm\n");
             throw new Exception("No key blob in keyStorage could be unwrapped for algorithm " + algo.name);
