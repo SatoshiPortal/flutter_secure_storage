@@ -1591,35 +1591,47 @@ public class FlutterSecureStorage {
             }
         }
 
+        // Log discovered key blobs
+        debugLog.append("  [KEYBLOB] Found ").append(keyBlobs.size()).append(" key blob(s) in keyStorage:\n");
+        for (String keyName : keyBlobs.keySet()) {
+            debugLog.append("  [KEYBLOB]   - ").append(keyName).append("\n");
+        }
+
         StorageCipher storageCipher = null;
         // Pass 1: current (non-_BACKUP) blobs
+        debugLog.append("  [KEYBLOB] Pass 1: Trying current (non-_BACKUP) blobs...\n");
         for (Map.Entry<String, String> blobEntry : keyBlobs.entrySet()) {
             if (!blobEntry.getKey().endsWith("_BACKUP")) {
                 try {
+                    debugLog.append("  [KEYBLOB] Trying blob: ").append(blobEntry.getKey()).append("\n");
                     storageCipher = factory.getCurrentStorageCipherWithBlob(context, cipher, blobEntry.getValue());
+                    debugLog.append("  [KEYBLOB] ✓ Success with: ").append(blobEntry.getKey()).append("\n");
                     break;
                 } catch (Exception ignore) {
-                    debugLog.append("  [WARN] Current blob '").append(blobEntry.getKey())
-                             .append("' failed: ").append(ignore.getMessage()).append("\n");
+                    debugLog.append("  [KEYBLOB] ✗ Failed '").append(blobEntry.getKey())
+                             .append("': ").append(ignore.getMessage()).append("\n");
                 }
             }
         }
         // Pass 2: _BACKUP blobs (old algorithm)
         if (storageCipher == null) {
+            debugLog.append("  [KEYBLOB] Pass 2: Trying _BACKUP blobs...\n");
             for (Map.Entry<String, String> blobEntry : keyBlobs.entrySet()) {
                 if (blobEntry.getKey().endsWith("_BACKUP")) {
                     try {
+                        debugLog.append("  [KEYBLOB] Trying backup blob: ").append(blobEntry.getKey()).append("\n");
                         storageCipher = factory.getCurrentStorageCipherWithBlob(context, cipher, blobEntry.getValue());
-                        debugLog.append("  [WARN] Using _BACKUP key blob: ").append(blobEntry.getKey()).append("\n");
+                        debugLog.append("  [KEYBLOB] ✓ Success with backup: ").append(blobEntry.getKey()).append("\n");
                         break;
                     } catch (Exception ignore) {
-                        debugLog.append("  [WARN] _BACKUP blob '").append(blobEntry.getKey())
-                                 .append("' failed: ").append(ignore.getMessage()).append("\n");
+                        debugLog.append("  [KEYBLOB] ✗ Failed backup '").append(blobEntry.getKey())
+                                 .append("': ").append(ignore.getMessage()).append("\n");
                     }
                 }
             }
         }
         if (storageCipher == null) {
+            debugLog.append("  [ERROR] No key blob could be unwrapped for this algorithm\n");
             throw new Exception("No key blob in keyStorage could be unwrapped for algorithm " + algo.name);
         }
 
