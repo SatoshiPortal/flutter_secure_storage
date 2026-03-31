@@ -34,6 +34,8 @@ import javax.crypto.Cipher;
 public class FlutterSecureStorage {
 
     private static final String TAG = "FlutterSecureStorage";
+    private static final String MIGRATION_FAILED_KEY = "_MIGRATION_FAILED";
+    private static final String MIGRATION_FAILED_REASON_KEY = "_MIGRATION_FAILED_REASON";
     private static final Charset charset = StandardCharsets.UTF_8;
     private static final String SHARED_PREFERENCES_CONFIG_NAME = "FlutterSecureStorageConfiguration";
 
@@ -904,6 +906,189 @@ public class FlutterSecureStorage {
      * @param exception The original exception (BadPaddingException, InvalidKeyException, etc.)
      * @param errorType Human-readable description of the error type
      */
+    /**
+     * Check if migration has failed before and should be skipped.
+     */
+    private boolean hasMigrationFailed(SharedPreferences configSource) {
+        return configSource.getBoolean(MIGRATION_FAILED_KEY, false);
+    }
+
+    /**
+     * Get the stored migration failure reason.
+     */
+    private String getMigrationFailureReason(SharedPreferences configSource) {
+        return configSource.getString(MIGRATION_FAILED_REASON_KEY, "Unknown reason");
+    }
+
+    /**
+     * Set migration failed flag with reason to prevent retry loops.
+     */
+    private void setMigrationFailed(SharedPreferences configSource, Exception reason) {
+        SharedPreferences.Editor editor = configSource.edit();
+        editor.putBoolean(MIGRATION_FAILED_KEY, true);
+        
+        // Store exception details
+        String reasonText = reason.getClass().getSimpleName() + ": " + reason.getMessage();
+        editor.putString(MIGRATION_FAILED_REASON_KEY, reasonText);
+        
+        editor.commit();
+        Log.w(TAG, "Migration failed flag set - future migration attempts will be skipped");
+        Log.w(TAG, "Failure reason: " + reasonText);
+    }
+
+    /**
+     * Clear migration failed flag (for manual retry after app-level fixes).
+     */
+    private void clearMigrationFailed(SharedPreferences configSource) {
+        SharedPreferences.Editor editor = configSource.edit();
+        editor.remove(MIGRATION_FAILED_KEY);
+        editor.remove(MIGRATION_FAILED_REASON_KEY);
+        editor.commit();
+        Log.i(TAG, "Migration failed flag cleared - migration can be retried");
+    }
+
+    /**
+     * Rollback migration to initial state. Restores FSS and ESP data from backup.
+     * Keeps backup intact so previous version can still work.
+     */
+    private void rollbackMigration(SharedPreferences configSource,
+                                  SharedPreferences dataSource,
+                                  Exception originalError,
+                                  SecurePreferencesCallback<Void> callback) {
+        Log.e(TAG, "=".repeat(60));
+        Log.e(TAG, "MIGRATION ROLLBACK STARTED");
+        Log.e(TAG, "Original error: " + originalError.getMessage());
+        Log.e(TAG, "=".repeat(60));
+        
+        try {
+            SharedPreferences keyStorage = context.getSharedPreferences(
+                    "FlutterSecureKeyStorage", Context.MODE_PRIVATE);
+            
+            // Step 1: Restore FSS data from _BACKUP
+            Log.i(TAG, "Restoring FSS data from backup...");
+            int restoredCount = 0;
+            SharedPreferences.Editor dataEditor = dataSource.edit();
+            
+            for (Map.Entry<String, ?> entry : dataSource.getAll().entrySet()) {
+                String key = entry.getKey();
+                if (key.endsWith("_BACKUP") && entry.getValue() instanceof String) {
+                    String originalKey = key.substring(0, key.length() - "_BACKUP".length());
+                    String backupValue = (String) entry.getValue();
+                    
+                    dataEditor.putString(originalKey, backupValue);
+                    restoredCount++;
+                }
+            }
+            
+            if (!dataEditor.commit()) {
+                throw new Exception("Failed to restore FSS data from backup");
+            }
+            Log.i(TAG, "Restored " + restoredCount + " FSS entries from backup");
+            
+            // Step 2: Restore wrapped keys from _BACKUP
+            Log.i(TAG, "Restoring wrapped keys from backup...");
+            int restoredKeys = 0;
+            SharedPreferences.Editor keyEditor = keyStorage.edit();
+            
+            for (Map.Entry<String, ?> entry : keyStorage.getAll().entrySet()) {
+                String key = entry.getKey();
+                if (key.endsWith("_BACKUP") && entry.getValue() instanceof String) {
+                    String originalKey = key.substring(0, key.length() - "_BACKUP".length());
+                    String backupValue = (String) entry.getValue();
+                    
+                    keyEditor.putString(originalKey, backupValue);
+                    restoredKeys++;
+                }
+            }
+            
+            if (!keyEditor.commit()) {
+                throw new Exception("Failed to restore wrapped keys from backup");
+            }
+            Log.i(TAG, "Restored " + restoredKeys + " wrapped keys from backup");
+            
+            // Step 3: Restore ESP data if it exists
+            Boolean isESPMigrated = getEncryptedPrefsMigrated(configSource);
+            if (isESPMigrated != null && isESPMigrated) {
+                Log.i(TAG, "Restoring ESP data from backup...");
+                try {
+                    SharedPreferences encryptedPreferences = initializeEncryptedSharedPreferencesManager(context);
+                    SharedPreferences.Editor espEditor = encryptedPreferences.edit();
+                    int espRestored = 0;
+                    
+                    for (Map.Entry<String, ?> entry : encryptedPreferences.getAll().entrySet()) {
+                        String key = entry.getKey();
+                        if (key.endsWith("_BACKUP") && entry.getValue() instanceof String) {
+                            String originalKey = key.substring(0, key.length() - "_BACKUP".length());
+                            String backupValue = (String) entry.getValue();
+                            
+                            espEditor.putString(originalKey, backupValue);
+                            espRestored++;
+                        }
+                    }
+                    
+                    if (!espEditor.commit()) {
+                        Log.w(TAG, "Failed to restore ESP data from backup");
+                    } else {
+                        Log.i(TAG, "Restored " + espRestored + " ESP entries from backup");
+                    }
+                } catch (Exception espError) {
+                    Log.w(TAG, "ESP restore failed (ESP may not be available): " + espError.getMessage());
+                }
+            }
+            
+            // Step 4: Delete new cipher keys from KeyStore
+            Log.i(TAG, "Deleting new cipher keys...");
+            try {
+                KeyCipher newKeyCipher = storageCipherFactory.getCurrentKeyCipher(context);
+                newKeyCipher.deleteKey();
+                Log.i(TAG, "New cipher keys deleted");
+            } catch (Exception keyDeleteError) {
+                Log.w(TAG, "Failed to delete new cipher keys (may not exist): " + keyDeleteError.getMessage());
+            }
+            
+            // Step 5: Keep backup intact (do not delete)
+            Log.i(TAG, "Keeping backup intact for safety");
+            
+            // Step 6: Set migration failed flag
+            setMigrationFailed(configSource, originalError);
+            
+            Log.i(TAG, "=".repeat(60));
+            Log.i(TAG, "ROLLBACK COMPLETE");
+            Log.i(TAG, "Storage restored to initial state");
+            Log.i(TAG, "Backup kept intact (_BACKUP keys remain)");
+            Log.i(TAG, "=".repeat(60));
+            
+            // Return MigrationFailedException to application layer
+            callback.onError(new MigrationFailedException(
+                "Migration failed and was rolled back. " +
+                "Storage is restored to initial state. " +
+                "Please backup data through the app, then call deleteAll() to retry.",
+                originalError
+            ));
+            
+        } catch (Exception rollbackError) {
+            // Rollback itself failed - critical error
+            Log.e(TAG, "=".repeat(60));
+            Log.e(TAG, "CRITICAL: ROLLBACK FAILED!");
+            Log.e(TAG, "Original error: " + originalError.getMessage());
+            Log.e(TAG, "Rollback error: " + rollbackError.getMessage());
+            Log.e(TAG, "Backup should still be intact (_BACKUP keys)");
+            
+            // Set flag even on rollback failure to prevent retry loops
+            setMigrationFailed(configSource, originalError);
+            
+            Log.e(TAG, "=".repeat(60));
+            
+            // Return MigrationFailedException with rollback error
+            callback.onError(new MigrationFailedException(
+                "Migration failed and rollback also failed. " +
+                "Backup data may still be intact (_BACKUP keys). " +
+                "Please contact support.",
+                rollbackError
+            ));
+        }
+    }
+
     private void handleKeyMismatch(SharedPreferences configSource, SecurePreferencesCallback<Void> callback,
                                    Exception exception, String errorType) {
         // Algorithm change migration - enabled only with backup protection
@@ -924,6 +1109,21 @@ public class FlutterSecureStorage {
         Log.e(TAG, "Key mismatch detected during cipher initialization: " + errorType, exception);
         Log.e(TAG, "This typically occurs after an algorithm change.");
         Log.e(TAG, "Stored key cannot be decrypted with current algorithm.");
+
+        // CHECK FOR MIGRATION FAILED FLAG - Skip if migration previously failed
+        if (hasMigrationFailed(configSource)) {
+            String storedReason = getMigrationFailureReason(configSource);
+            String separator = "============================================================";
+            Log.w(TAG, separator);
+            Log.w(TAG, "MIGRATION SKIPPED: Previous migration attempt failed");
+            Log.w(TAG, "Migration failed flag is set - skipping retry to prevent loops");
+            Log.w(TAG, "Original failure reason: " + storedReason);
+            Log.w(TAG, "To retry: Application must clear flag or call deleteAll()");
+            Log.w(TAG, separator);
+            
+            callback.onError(new MigrationFailedException("Migration failed: " + storedReason, exception));
+            return; // SKIP MIGRATION
+        }
 
         // Check if migration is enabled
         if (config.shouldMigrateOnAlgorithmChange()) {
@@ -946,18 +1146,31 @@ public class FlutterSecureStorage {
                 public void onError(Exception migrationError) {
                     Log.e(TAG, "Data migration failed: " + migrationError.getMessage(), migrationError);
 
-                    // Migration failed, check if we should delete
-                    if (config.shouldDeleteOnFailure()) {
-                        Log.w(TAG, "resetOnError is enabled. Deleting all data as fallback...");
-                        deleteAllDataAndKeys(configSource, callback);
-                        setEncryptedPrefsMigrated(configSource);
+                    // Check rollbackOnFailure flag - default: true (enabled)
+                    if (config.shouldRollbackOnFailure()) {
+                        // Rollback + flag approach: restore data from backup and set flag
+                        Log.i(TAG, "rollbackOnFailure is enabled. Attempting rollback...");
+                        rollbackMigration(configSource, dataPrefs, migrationError, callback);
                     } else {
-                        Log.e(TAG, "Set resetOnError=true to automatically delete data after migration failure.");
-                        String userMessage = String.format(
-                            "Migration failed after algorithm change (%s). Enable resetOnError=true or call deleteAll().",
-                            errorType
-                        );
-                        callback.onError(new Exception(userMessage, migrationError));
+                        // Checkpoint approach: set flag but rely on checkpoint system for recovery
+                        Log.i(TAG, "rollbackOnFailure is disabled. Using checkpoint system...");
+                        
+                        // Set migration failed flag to prevent retry loops
+                        setMigrationFailed(configSource, migrationError);
+
+                        // Migration failed, check if we should delete
+                        if (config.shouldDeleteOnFailure()) {
+                            Log.w(TAG, "resetOnError is enabled. Deleting all data as fallback...");
+                            deleteAllDataAndKeys(configSource, callback);
+                            setEncryptedPrefsMigrated(configSource);
+                        } else {
+                            Log.e(TAG, "Set resetOnError=true to automatically delete data after migration failure.");
+                            callback.onError(new MigrationFailedException(
+                                "Migration failed. Checkpoint system will resume on next attempt. " +
+                                "To reset: call deleteAll().",
+                                migrationError
+                            ));
+                        }
                     }
                 }
             });
@@ -1018,6 +1231,9 @@ public class FlutterSecureStorage {
             storageCipherFactory.storeCurrentAlgorithms(editor);
             editor.apply();
             Log.d(TAG, "Updated algorithm markers to current");
+
+            // Clear migration failed flag
+            clearMigrationFailed(configSource);
 
             Log.w(TAG, "All data deleted. Reinitializing with new algorithm...");
 

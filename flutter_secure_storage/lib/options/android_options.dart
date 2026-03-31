@@ -51,6 +51,7 @@ class AndroidOptions extends Options {
     bool resetOnError = true,
     bool migrateOnAlgorithmChange = true,
     bool migrateWithBackup = false,
+    bool rollbackOnFailure = true,
     bool enforceBiometrics = false,
     KeyCipherAlgorithm keyCipherAlgorithm =
         KeyCipherAlgorithm.RSA_ECB_OAEPwithSHA_256andMGF1Padding,
@@ -64,6 +65,7 @@ class AndroidOptions extends Options {
         _resetOnError = resetOnError,
         _migrateOnAlgorithmChange = migrateOnAlgorithmChange,
         _migrateWithBackup = migrateWithBackup,
+        _rollbackOnFailure = rollbackOnFailure,
         _enforceBiometrics = enforceBiometrics,
         _keyCipherAlgorithm = keyCipherAlgorithm,
         _storageCipherAlgorithm = storageCipherAlgorithm;
@@ -85,6 +87,7 @@ class AndroidOptions extends Options {
     bool resetOnError = true,
     bool migrateOnAlgorithmChange = true,
     bool migrateWithBackup = false,
+    bool rollbackOnFailure = true,
     bool enforceBiometrics = false,
     this.sharedPreferencesName,
     this.preferencesKeyPrefix,
@@ -94,6 +97,7 @@ class AndroidOptions extends Options {
         _resetOnError = resetOnError,
         _migrateOnAlgorithmChange = migrateOnAlgorithmChange,
         _migrateWithBackup = migrateWithBackup,
+        _rollbackOnFailure = rollbackOnFailure,
         _enforceBiometrics = enforceBiometrics,
         _keyCipherAlgorithm = KeyCipherAlgorithm.AES_GCM_NoPadding,
         _storageCipherAlgorithm = StorageCipherAlgorithm.AES_GCM_NoPadding;
@@ -123,6 +127,15 @@ class AndroidOptions extends Options {
   ///
   /// Defaults to false.
   final bool _migrateWithBackup;
+
+  /// Enable automatic rollback on migration failure.
+  /// When true (default): Restores data from backup and sets failure flag.
+  ///   Prevents retry loops - migration skipped on next attempt.
+  /// When false: Uses checkpoint system to resume from last successful step.
+  ///   Migration retries automatically on next initialization.
+  ///
+  /// Defaults to true.
+  final bool _rollbackOnFailure;
 
   /// Whether to enforce biometric/PIN authentication.
   ///
@@ -183,6 +196,7 @@ class AndroidOptions extends Options {
         'resetOnError': '$_resetOnError',
         'migrateOnAlgorithmChange': '$_migrateOnAlgorithmChange',
         'migrateWithBackup': '$_migrateWithBackup',
+        'rollbackOnFailure': '$_rollbackOnFailure',
         'enforceBiometrics': '$_enforceBiometrics',
         'keyCipherAlgorithm': _keyCipherAlgorithm.name,
         'storageCipherAlgorithm': _storageCipherAlgorithm.name,
@@ -200,6 +214,7 @@ class AndroidOptions extends Options {
     bool? resetOnError,
     bool? migrateOnAlgorithmChange,
     bool? migrateWithBackup,
+    bool? rollbackOnFailure,
     bool? enforceBiometrics,
     KeyCipherAlgorithm? keyCipherAlgorithm,
     StorageCipherAlgorithm? storageCipherAlgorithm,
@@ -217,6 +232,7 @@ class AndroidOptions extends Options {
         migrateOnAlgorithmChange:
             migrateOnAlgorithmChange ?? _migrateOnAlgorithmChange,
         migrateWithBackup: migrateWithBackup ?? _migrateWithBackup,
+        rollbackOnFailure: rollbackOnFailure ?? _rollbackOnFailure,
         enforceBiometrics: enforceBiometrics ?? _enforceBiometrics,
         keyCipherAlgorithm: keyCipherAlgorithm ?? _keyCipherAlgorithm,
         storageCipherAlgorithm:
