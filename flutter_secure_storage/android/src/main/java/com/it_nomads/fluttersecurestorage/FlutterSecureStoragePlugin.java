@@ -23,12 +23,14 @@ import io.flutter.plugin.common.MethodChannel.Result;
 public class FlutterSecureStoragePlugin implements MethodCallHandler, FlutterPlugin {
 
     private static final String TAG = "FlutterSecureStoragePlugin";
+    private static final String DTAG = "FSS10";
     private MethodChannel channel;
     private FlutterSecureStorage secureStorage;
     private HandlerThread workerThread;
     private Handler workerThreadHandler;
 
     public void initInstance(BinaryMessenger messenger, Context context) {
+        Log.d(DTAG, "Plugin initInstance() — creating FlutterSecureStorage");
         try {
             secureStorage = new FlutterSecureStorage(context);
 
@@ -125,77 +127,96 @@ public class FlutterSecureStoragePlugin implements MethodCallHandler, FlutterPlu
             Map<String, Object> options = (Map<String, Object>) ((Map<String, Object>) call.arguments).get("options");
             FlutterSecureStorageConfig config = new FlutterSecureStorageConfig(options);
 
+            Log.d(DTAG, "MethodRunner.run() — method=" + call.method);
+
             secureStorage.initialize(config, new SecurePreferencesCallback<>() {
                 @Override
                 public void onSuccess(Void unused) {
+                    Log.d(DTAG, "MethodRunner — initialize() succeeded, dispatching method=" + call.method);
                     try {
                         switch (call.method) {
                             case "write": {
                                 String key = getKeyFromCall(call);
                                 String value = getValueFromCall(call);
+                                Log.d(DTAG, "MethodRunner — write key: " + key + " (value " + (value != null ? "present, len=" + value.length() : "NULL") + ")");
 
                                 if (value != null) {
                                     secureStorage.write(key, value);
                                     result.success(null);
                                 } else {
+                                    Log.e(DTAG, "MethodRunner — write FAILED: value is null for key: " + key);
                                     result.error("null", null, null);
                                 }
                                 break;
                             }
                             case "read": {
                                 String key = getKeyFromCall(call);
+                                Log.d(DTAG, "MethodRunner — read key: " + key);
 
                                 if (secureStorage.containsKey(key)) {
                                     String value = secureStorage.read(key);
+                                    Log.d(DTAG, "MethodRunner — read success for key: " + key + " (value " + (value != null ? "present" : "null") + ")");
                                     result.success(value);
                                 } else {
+                                    Log.d(DTAG, "MethodRunner — read key not found: " + key);
                                     result.success(null);
                                 }
                                 break;
                             }
                             case "readAll": {
-                                result.success(secureStorage.readAll());
+                                Map<String, String> all = secureStorage.readAll();
+                                Log.d(DTAG, "MethodRunner — readAll returned " + all.size() + " entries");
+                                result.success(all);
                                 break;
                             }
                             case "containsKey": {
                                 String key = getKeyFromCall(call);
 
                                 boolean containsKey = secureStorage.containsKey(key);
+                                Log.d(DTAG, "MethodRunner — containsKey(" + key + ") = " + containsKey);
                                 result.success(containsKey);
                                 break;
                             }
                             case "delete": {
                                 String key = getKeyFromCall(call);
+                                Log.d(DTAG, "MethodRunner — delete key: " + key);
 
                                 secureStorage.delete(key);
                                 result.success(null);
                                 break;
                             }
                             case "deleteAll": {
+                                Log.w(DTAG, "MethodRunner — deleteAll called");
                                 secureStorage.deleteAll();
                                 result.success(null);
                                 break;
                             }
                             case "isBiometricAvailable": {
                                 boolean available = secureStorage.isBiometricAvailable();
+                                Log.d(DTAG, "MethodRunner — isBiometricAvailable = " + available);
                                 result.success(available);
                                 break;
                             }
                             case "isDeviceSecure": {
                                 boolean secure = secureStorage.isDeviceSecure();
+                                Log.d(DTAG, "MethodRunner — isDeviceSecure = " + secure);
                                 result.success(secure);
                                 break;
                             }
                             default:
+                                Log.w(DTAG, "MethodRunner — unrecognized method: " + call.method);
                                 result.notImplemented();
                                 break;
                         }
                     } catch (Exception e) {
+                        Log.e(DTAG, "MethodRunner — exception in " + call.method + ": " + e.getMessage());
                         if (config.shouldDeleteOnFailure()) {
                             try {
+                                Log.w(DTAG, "MethodRunner — resetOnError triggered, deleting all data");
                                 secureStorage.deleteAll();
                                 result.success("Data has been reset");
                             } catch (Exception ex) {
+                                Log.e(DTAG, "MethodRunner — resetOnError deleteAll also failed: " + ex.getMessage());
                                 handleException(ex);
                             }
                         } else {
@@ -206,6 +227,7 @@ public class FlutterSecureStoragePlugin implements MethodCallHandler, FlutterPlu
 
                 @Override
                 public void onError(Exception e) {
+                    Log.e(DTAG, "MethodRunner — initialize() FAILED for method=" + call.method + ": " + e.getMessage());
                     handleException(e);
                 }
             });

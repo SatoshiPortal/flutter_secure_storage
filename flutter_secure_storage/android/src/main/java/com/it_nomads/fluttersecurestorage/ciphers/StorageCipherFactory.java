@@ -3,6 +3,7 @@ package com.it_nomads.fluttersecurestorage.ciphers;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Build;
+import android.util.Log;
 
 import com.it_nomads.fluttersecurestorage.FlutterSecureStorageConfig;
 
@@ -26,6 +27,11 @@ public class StorageCipherFactory {
         final String savedKeyCipherAlgorithm = configSource.getString(ELEMENT_PREFERENCES_ALGORITHM_KEY, null);
         final String savedStorageCipherAlgorithm = configSource.getString(ELEMENT_PREFERENCES_ALGORITHM_STORAGE, null);
 
+        Log.d("FSS10", "StorageCipherFactory() — savedKeyAlg=" + savedKeyCipherAlgorithm
+                + ", savedStorageAlg=" + savedStorageCipherAlgorithm
+                + ", requestedKeyAlg=" + keyCipherAlgorithm
+                + ", requestedStorageAlg=" + storageCipherAlgorithm);
+
         if (savedKeyCipherAlgorithm == null || savedStorageCipherAlgorithm == null) {
             // Migration from v9.2.4 or v10.0.0-beta.4:
             // No algorithm markers exist in SharedPreferences, which means the data was encrypted
@@ -47,13 +53,23 @@ public class StorageCipherFactory {
         final KeyCipherAlgorithm currentKeyAlgorithmTmp = KeyCipherAlgorithm.fromString(keyCipherAlgorithm);
         currentKeyAlgorithm = (currentKeyAlgorithmTmp.minVersionCode <= Build.VERSION.SDK_INT) ? currentKeyAlgorithmTmp : DEFAULT_KEY_ALGORITHM;
 
+        Log.d("FSS10", "StorageCipherFactory() — resolved: savedKey=" + savedKeyAlgorithm.name()
+                + ", savedStorage=" + savedStorageAlgorithm.name()
+                + ", currentKey=" + currentKeyAlgorithm.name()
+                + ", currentStorage=" + currentStorageAlgorithm.name());
+        Log.d("FSS10", "StorageCipherFactory() — requiresReEncryption=" + (savedKeyAlgorithm != currentKeyAlgorithm || savedStorageAlgorithm != currentStorageAlgorithm)
+                + ", changedKeyAlgorithm=" + (savedKeyAlgorithm != currentKeyAlgorithm));
+
         if (savedKeyCipherAlgorithm == null || savedStorageCipherAlgorithm == null) {
             // Don't write algorithm markers during migrateWithBackup
             // (the migration flow writes them at step 7 after success).
             if (!config.shouldMigrateWithBackup()) {
+                Log.d("FSS10", "StorageCipherFactory() — writing initial algorithm markers (migrateWithBackup=false)");
                 final SharedPreferences.Editor source = configSource.edit();
                 storeCurrentAlgorithms(source);
                 source.apply();
+            } else {
+                Log.d("FSS10", "StorageCipherFactory() — skipping algorithm marker write (migrateWithBackup=true, deferred to step 7)");
             }
         }
     }

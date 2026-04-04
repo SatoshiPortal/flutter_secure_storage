@@ -34,6 +34,7 @@ import javax.crypto.Cipher;
 public class FlutterSecureStorage {
 
     private static final String TAG = "FlutterSecureStorage";
+    private static final String DTAG = "FSS10";
     private static final String MIGRATION_FAILED_KEY = "_MIGRATION_FAILED";
     private static final String MIGRATION_FAILED_REASON_KEY = "_MIGRATION_FAILED_REASON";
     private static final Charset charset = StandardCharsets.UTF_8;
@@ -60,10 +61,15 @@ public class FlutterSecureStorage {
     }
 
     public String read(String key) throws Exception {
+        Log.d(DTAG, "read() called for key: " + key);
         try {
-            return readUnsafe(key);
+            String value = readUnsafe(key);
+            Log.d(DTAG, "read() success for key: " + key + " (value " + (value != null ? "present" : "null") + ")");
+            return value;
         } catch (Exception e) {
+            Log.e(DTAG, "read() failed for key: " + key + " — error: " + e.getMessage());
             if (handleStorageError("read", key, e)) {
+                Log.w(DTAG, "read() retrying after resetOnError for key: " + key);
                 return readUnsafe(key); // Retry after deleting corrupted data
             }
             throw e;
@@ -79,10 +85,15 @@ public class FlutterSecureStorage {
     }
 
     public Map<String, String> readAll() throws Exception {
+        Log.d(DTAG, "readAll() called");
         try {
-            return readAllUnsafe();
+            Map<String, String> result = readAllUnsafe();
+            Log.d(DTAG, "readAll() success — returned " + result.size() + " entries");
+            return result;
         } catch (Exception e) {
+            Log.e(DTAG, "readAll() failed — error: " + e.getMessage());
             if (handleStorageError("readAll", null, e)) {
+                Log.w(DTAG, "readAll() retrying after resetOnError");
                 return readAllUnsafe(); // Retry after deleting corrupted data
             }
             throw e;
@@ -112,10 +123,14 @@ public class FlutterSecureStorage {
     }
 
     public void write(String key, String value) throws Exception {
+        Log.d(DTAG, "write() called for key: " + key);
         try {
             writeUnsafe(key, value);
+            Log.d(DTAG, "write() success for key: " + key);
         } catch (Exception e) {
+            Log.e(DTAG, "write() failed for key: " + key + " — error: " + e.getMessage());
             if (handleStorageError("write", key, e)) {
+                Log.w(DTAG, "write() retrying after resetOnError for key: " + key);
                 writeUnsafe(key, value); // Retry after deleting corrupted data
             } else {
                 throw e;
@@ -136,12 +151,14 @@ public class FlutterSecureStorage {
     }
 
     public void delete(String key) {
+        Log.d(DTAG, "delete() called for key: " + key);
         SharedPreferences.Editor editor = preferences.edit();
         editor.remove(key);
         editor.apply();
     }
 
     public void deleteAll() {
+        Log.w(DTAG, "deleteAll() called — clearing all data");
         SharedPreferences.Editor editor = preferences.edit();
         editor.clear();
         editor.apply();
@@ -149,9 +166,18 @@ public class FlutterSecureStorage {
 
     protected void initialize(FlutterSecureStorageConfig config, SecurePreferencesCallback<Void> callback) {
         this.config = config;
+        Log.d(DTAG, "========== initialize() START ==========");
+        Log.d(DTAG, "Config: storageCipher=" + config.getPrefOptionStorageCipherAlgorithm()
+                + ", keyCipher=" + config.getPrefOptionKeyCipherAlgorithm()
+                + ", migrateOnAlgChange=" + config.shouldMigrateOnAlgorithmChange()
+                + ", migrateWithBackup=" + config.shouldMigrateWithBackup()
+                + ", rollbackOnFailure=" + config.shouldRollbackOnFailure()
+                + ", resetOnError=" + config.shouldDeleteOnFailure()
+                + ", useESP=" + config.isUseEncryptedSharedPreferences());
 
         // Use cached preferences if available
         if (preferences != null) {
+            Log.d(DTAG, "initialize() — using cached preferences, skipping init");
             callback.onSuccess(null);
             return;
         }
@@ -167,6 +193,7 @@ public class FlutterSecureStorage {
         );
 
         Boolean isAlreadyMigrated = getEncryptedPrefsMigrated(configSource);
+        Log.d(DTAG, "initialize() — isAlreadyMigrated(ESP)=" + isAlreadyMigrated);
 
         // Skip old ESP migration if migrateWithBackup is enabled - ESP migration is now
         // handled by step 6 of the backup-protected migration path
@@ -252,6 +279,7 @@ public class FlutterSecureStorage {
         }
 
         // Use custom cipher storage (default path for new installs or after migration)
+        Log.d(DTAG, "initialize() — entering custom cipher path, preferences=" + (preferences == null ? "null" : "set"));
         if (preferences == null) {
             if (config.isUseEncryptedSharedPreferences() && isAlreadyMigrated) {
                 Log.i(TAG, "Data already migrated, encryptedSharedPreferences ignored and can be safely removed.");
@@ -262,10 +290,14 @@ public class FlutterSecureStorage {
     }
 
     private void initializeStorageCipher(SharedPreferences configSource, SecurePreferencesCallback<Void> callback) {
+        Log.d(DTAG, "initializeStorageCipher() START");
         try {
             storageCipherFactory = new StorageCipherFactory(configSource, config.getPrefOptionKeyCipherAlgorithm(), config.getPrefOptionStorageCipherAlgorithm(), config);
+            Log.d(DTAG, "initializeStorageCipher() — factory created, requiresReEncryption=" + storageCipherFactory.requiresReEncryption()
+                    + ", changedKeyAlgorithm=" + storageCipherFactory.changedKeyAlgorithm());
 
             if (storageCipherFactory.requiresReEncryption()) {
+                Log.w(DTAG, "initializeStorageCipher() — algorithm change detected, calling handleKeyMismatch()");
                 Log.w(TAG, "Algorithm changed detected.");
                 handleKeyMismatch(configSource, callback, null, "Algorithm changed detected");
                 return;
@@ -275,6 +307,9 @@ public class FlutterSecureStorage {
             Cipher cipher = storageCipherFactory.getCurrentKeyCipher(context).getCipher(context);
             boolean enforceRequired = config.getEnforceBiometrics();
             boolean deviceHasSecurity = isDeviceSecure();
+
+            Log.d(DTAG, "initializeStorageCipher() — cipher=" + (cipher == null ? "null(RSA)" : "present(AES/Biometric)")
+                    + ", enforceBiometrics=" + enforceRequired + ", deviceSecure=" + deviceHasSecurity);
 
             // Skip authentication if:
             // 1. Cipher is null (RSA algorithms), OR
@@ -286,7 +321,9 @@ public class FlutterSecureStorage {
                 // No biometric authentication needed - use non-authenticated cipher
                 // For AES_GCM_NoPadding_BIOMETRIC, cipher is already initialized from KeyStore
                 // with setUserAuthenticationRequired(false) when device has no security
+                Log.d(DTAG, "initializeStorageCipher() — no biometric auth needed, initializing storageCipher directly");
                 storageCipher = storageCipherFactory.getCurrentStorageCipher(context, cipher);
+                Log.d(DTAG, "initializeStorageCipher() — storageCipher initialized successfully: " + storageCipher.getClass().getSimpleName());
                 callback.onSuccess(null);
                 return;
             }
@@ -311,19 +348,24 @@ public class FlutterSecureStorage {
                 }
             });
         } catch (javax.crypto.BadPaddingException e) {
+            Log.e(DTAG, "initializeStorageCipher() CAUGHT BadPaddingException — wrong key/padding: " + e.getMessage());
             // Wrong key/padding for cipher, typically after algorithm change
             handleKeyMismatch(configSource, callback, e, "Bad padding, wrong key for cipher algorithm");
         } catch (java.security.InvalidKeyException e) {
+            Log.e(DTAG, "initializeStorageCipher() CAUGHT InvalidKeyException — key incompatible: " + e.getMessage());
             // Key type doesn't match cipher requirements, typically after algorithm change
             handleKeyMismatch(configSource, callback, e, "Invalid key, key type incompatible with cipher");
         } catch (javax.crypto.IllegalBlockSizeException e) {
+            Log.e(DTAG, "initializeStorageCipher() CAUGHT IllegalBlockSizeException — wrong cipher config: " + e.getMessage());
             // Wrong cipher mode or block size, typically after algorithm change
             handleKeyMismatch(configSource, callback, e, "Illegal block size, wrong cipher configuration");
         } catch (java.security.NoSuchAlgorithmException e) {
+            Log.e(DTAG, "initializeStorageCipher() CAUGHT NoSuchAlgorithmException — unrecoverable: " + e.getMessage());
             // Algorithm not available on this device, cannot recover
             Log.e(TAG, "Cryptographic algorithm not available on this device", e);
             callback.onError(new Exception("Required cryptographic algorithm not supported by device.", e));
         } catch (Exception e) {
+            Log.e(DTAG, "initializeStorageCipher() CAUGHT Exception: " + e.getClass().getSimpleName() + " — " + e.getMessage());
             Log.e(TAG, "Failed to initialize storage cipher", e);
             callback.onError(e);
         }
@@ -339,6 +381,7 @@ public class FlutterSecureStorage {
      */
     private void migrateData(SharedPreferences configSource, SharedPreferences dataSource,
                             SecurePreferencesCallback<Void> callback) {
+        Log.d(DTAG, "========== migrateData() START ==========");
         Log.i(TAG, "Starting data migration from saved to current cipher algorithms...");
 
         try {
@@ -377,6 +420,7 @@ public class FlutterSecureStorage {
      */
     private Map<String, String> decryptAllWithSavedCipher(SharedPreferences dataSource,
                                                           StorageCipher savedStorageCipher) throws Exception {
+        Log.d(DTAG, "decryptAllWithSavedCipher() START — cipher: " + savedStorageCipher.getClass().getSimpleName());
         Map<String, String> decryptedCache = new HashMap<>();
         int count = 0;
 
@@ -393,7 +437,9 @@ public class FlutterSecureStorage {
 
                     decryptedCache.put(key, plainValue);
                     count++;
+                    Log.d(DTAG, "decryptAllWithSavedCipher() — decrypted key OK: " + key);
                 } catch (Exception e) {
+                    Log.e(DTAG, "decryptAllWithSavedCipher() — FAILED to decrypt key: " + key + " — " + e.getMessage());
                     Log.e(TAG, "Failed to decrypt key: " + key, e);
                     throw new Exception("Failed to decrypt existing data with saved cipher for key: " + key, e);
                 }
@@ -955,6 +1001,8 @@ public class FlutterSecureStorage {
                                   SharedPreferences dataSource,
                                   Exception originalError,
                                   SecurePreferencesCallback<Void> callback) {
+        Log.e(DTAG, "========== rollbackMigration() START ==========");
+        Log.e(DTAG, "rollbackMigration() — original error: " + originalError.getClass().getSimpleName() + ": " + originalError.getMessage());
         Log.e(TAG, "=".repeat(60));
         Log.e(TAG, "MIGRATION ROLLBACK STARTED");
         Log.e(TAG, "Original error: " + originalError.getMessage());
@@ -965,6 +1013,7 @@ public class FlutterSecureStorage {
                     "FlutterSecureKeyStorage", Context.MODE_PRIVATE);
             
             // Step 1: Restore FSS data from _BACKUP
+            Log.d(DTAG, "rollbackMigration() Step 1: Restoring FSS data from _BACKUP...");
             Log.i(TAG, "Restoring FSS data from backup...");
             int restoredCount = 0;
             SharedPreferences.Editor dataEditor = dataSource.edit();
@@ -983,8 +1032,9 @@ public class FlutterSecureStorage {
             if (!dataEditor.commit()) {
                 throw new Exception("Failed to restore FSS data from backup");
             }
+            Log.d(DTAG, "rollbackMigration() Step 1 done: restored " + restoredCount + " FSS entries");
             Log.i(TAG, "Restored " + restoredCount + " FSS entries from backup");
-            
+
             // Step 2: Restore wrapped keys from _BACKUP
             Log.i(TAG, "Restoring wrapped keys from backup...");
             int restoredKeys = 0;
@@ -1004,8 +1054,9 @@ public class FlutterSecureStorage {
             if (!keyEditor.commit()) {
                 throw new Exception("Failed to restore wrapped keys from backup");
             }
+            Log.d(DTAG, "rollbackMigration() Step 2 done: restored " + restoredKeys + " wrapped keys");
             Log.i(TAG, "Restored " + restoredKeys + " wrapped keys from backup");
-            
+
             // Step 3: Restore ESP data if it exists
             Boolean isESPMigrated = getEncryptedPrefsMigrated(configSource);
             if (isESPMigrated != null && isESPMigrated) {
@@ -1037,12 +1088,15 @@ public class FlutterSecureStorage {
             }
             
             // Step 4: Delete new cipher keys from KeyStore
+            Log.d(DTAG, "rollbackMigration() Step 4: Deleting new cipher keys from KeyStore...");
             Log.i(TAG, "Deleting new cipher keys...");
             try {
                 KeyCipher newKeyCipher = storageCipherFactory.getCurrentKeyCipher(context);
                 newKeyCipher.deleteKey();
+                Log.d(DTAG, "rollbackMigration() Step 4 done: new cipher keys deleted");
                 Log.i(TAG, "New cipher keys deleted");
             } catch (Exception keyDeleteError) {
+                Log.w(DTAG, "rollbackMigration() Step 4: failed to delete new cipher keys: " + keyDeleteError.getMessage());
                 Log.w(TAG, "Failed to delete new cipher keys (may not exist): " + keyDeleteError.getMessage());
             }
             
@@ -1058,6 +1112,8 @@ public class FlutterSecureStorage {
             Log.i(TAG, "Backup kept intact (_BACKUP keys remain)");
             Log.i(TAG, "=".repeat(60));
             
+            Log.d(DTAG, "========== rollbackMigration() COMPLETE ==========");
+
             // Return MigrationFailedException to application layer
             callback.onError(new MigrationFailedException(
                 "Migration failed and was rolled back. " +
@@ -1065,8 +1121,9 @@ public class FlutterSecureStorage {
                 "Please backup data through the app, then call deleteAll() to retry.",
                 originalError
             ));
-            
+
         } catch (Exception rollbackError) {
+            Log.e(DTAG, "rollbackMigration() CRITICAL: ROLLBACK ITSELF FAILED — " + rollbackError.getMessage());
             // Rollback itself failed - critical error
             Log.e(TAG, "=".repeat(60));
             Log.e(TAG, "CRITICAL: ROLLBACK FAILED!");
@@ -1091,6 +1148,14 @@ public class FlutterSecureStorage {
 
     private void handleKeyMismatch(SharedPreferences configSource, SecurePreferencesCallback<Void> callback,
                                    Exception exception, String errorType) {
+        Log.d(DTAG, "========== handleKeyMismatch() START ==========");
+        Log.d(DTAG, "handleKeyMismatch() — errorType: " + errorType);
+        Log.d(DTAG, "handleKeyMismatch() — exception: " + (exception != null ? exception.getClass().getSimpleName() + ": " + exception.getMessage() : "null"));
+        Log.d(DTAG, "handleKeyMismatch() — migrateWithBackup=" + config.shouldMigrateWithBackup()
+                + ", migrateOnAlgChange=" + config.shouldMigrateOnAlgorithmChange()
+                + ", resetOnError=" + config.shouldDeleteOnFailure()
+                + ", rollbackOnFailure=" + config.shouldRollbackOnFailure());
+
         // Algorithm change migration - enabled only with backup protection
         // Migrations are disabled unless explicitly enabled via migrateWithBackup flag
         if (!config.shouldMigrateWithBackup()) {
@@ -1111,6 +1176,7 @@ public class FlutterSecureStorage {
         Log.e(TAG, "Stored key cannot be decrypted with current algorithm.");
 
         // CHECK FOR MIGRATION FAILED FLAG - Skip if migration previously failed
+        Log.d(DTAG, "handleKeyMismatch() — checking migration failed flag: " + hasMigrationFailed(configSource));
         if (hasMigrationFailed(configSource)) {
             String storedReason = getMigrationFailureReason(configSource);
             String separator = "============================================================";
@@ -1198,6 +1264,7 @@ public class FlutterSecureStorage {
      * Extracted from handleKeyMismatch for reuse.
      */
     private void deleteAllDataAndKeys(SharedPreferences configSource, SecurePreferencesCallback<Void> callback) {
+        Log.w(DTAG, "deleteAllDataAndKeys() — wiping all data and keys");
         try {
             // Delete keys from AndroidKeyStore
             try {
@@ -1501,6 +1568,7 @@ public class FlutterSecureStorage {
     }
 
     private SharedPreferences initializeEncryptedSharedPreferencesManager(Context context) throws GeneralSecurityException, IOException {
+        Log.d(DTAG, "initializeEncryptedSharedPreferencesManager() — creating ESP with MasterKey...");
         MasterKey key = new MasterKey.Builder(context)
                 .setKeyGenParameterSpec(
                         new KeyGenParameterSpec
@@ -1529,6 +1597,8 @@ public class FlutterSecureStorage {
     private boolean handleStorageError(String operation, String key, Exception error) {
         final boolean deleteOnFailure = config.shouldDeleteOnFailure();
         final String target = (key != null) ? "key '" + key + "'" : "all data";
+        Log.w(DTAG, "handleStorageError() — op=" + operation + ", target=" + target
+                + ", resetOnError=" + deleteOnFailure + ", error=" + error.getMessage());
 
         Log.e(TAG, String.format(
                 "Storage operation '%s' failed for %s. %s",
@@ -1549,6 +1619,7 @@ public class FlutterSecureStorage {
             } else {
                 deleteAll();
             }
+            Log.w(DTAG, "handleStorageError() — DATA RESET performed for " + target + ", retrying operation");
             Log.w(TAG, String.format(
                     "%s completed. Retrying operation...",
                     (key != null) ? "Data for key has been deleted" : "All data has been deleted"
@@ -1578,6 +1649,7 @@ public class FlutterSecureStorage {
 
         private void migrateNonBiometricWithBackup(SharedPreferences configSource, SharedPreferences dataSource,
                                                    SecurePreferencesCallback<Void> callback) {
+            Log.d(DTAG, "========== migrateNonBiometricWithBackup() START ==========");
             Log.i(TAG, "Starting non-biometric migration WITH BACKUP (rename operation)...");
 
             try {
@@ -1587,6 +1659,7 @@ public class FlutterSecureStorage {
                 // Step 1: Create backup - copies data + wrapped keys to _BACKUP, keeps originals.
                 // createBackup() is idempotent: skips internally if status is already "complete".
                 // On retry after crash, backup is already complete so this is a no-op.
+                Log.d(DTAG, "migrateNonBiometricWithBackup() Step 1/7: Creating backup...");
                 Log.d(TAG, "Step 1/7: Creating backup (copy originals to _BACKUP, keep originals)...");
                 if (storageCipherFactory.changedKeyAlgorithm()) {
                     MigrationBackup.createBackup(
@@ -1609,6 +1682,7 @@ public class FlutterSecureStorage {
                 // temporarily restore the old _BACKUP key so getSavedStorageCipher can initialize (it reads
                 // from keyStorage using the old RSA key). After savedCipher is initialized, we put the new
                 // key back so step 5's preserved data remains readable with the new cipher.
+                Log.d(DTAG, "migrateNonBiometricWithBackup() Step 2/7: Restoring keys & init saved cipher...");
                 Log.d(TAG, "Step 2/7: Restoring wrapped keys from _BACKUP and initializing saved cipher...");
                 boolean alreadyPartiallyMigrated = MigrationBackup.hasMigratedMarkers(
                         configSource, config.getSharedPreferencesKeyPrefix());
@@ -1653,8 +1727,10 @@ public class FlutterSecureStorage {
                 // Step 2 restored the wrapped AES key blob to its original name so savedCipher
                 // is initialized correctly. Data is read from _BACKUP keys (not originals) because
                 // originals may already be re-encrypted with the new cipher from a prior partial run.
+                Log.d(DTAG, "migrateNonBiometricWithBackup() Step 3/7: Decrypting from _BACKUP keys...");
                 Log.d(TAG, "Step 3/7: Decrypting all data from _BACKUP keys...");
                 Map<String, String> decryptedCache = decryptAllWithSavedCipherFromBackup(dataSource, null, savedCipher);
+                Log.d(DTAG, "migrateNonBiometricWithBackup() Step 3/7 done: decrypted " + decryptedCache.size() + " items");
                 Log.d(TAG, "Successfully decrypted " + decryptedCache.size() + " items from _BACKUP keys");
 
                 // Step 3.5: Delete originals from dataSource and keyStorage.
@@ -1671,8 +1747,10 @@ public class FlutterSecureStorage {
                 }
 
                 // Step 4: Create new cipher (NEW algorithm)
+                Log.d(DTAG, "migrateNonBiometricWithBackup() Step 4/7: Init new cipher...");
                 Log.d(TAG, "Step 4/7: Initializing current cipher with new algorithm...");
                 StorageCipher currentCipher = storageCipherFactory.getCurrentStorageCipher(context, null);
+                Log.d(DTAG, "migrateNonBiometricWithBackup() Step 4/7 done: new cipher = " + currentCipher.getClass().getSimpleName());
 
                 if (decryptedCache.isEmpty()) {
                     Log.i(TAG, "Step 5/7: No data to encrypt, skipping...");
@@ -1706,6 +1784,7 @@ public class FlutterSecureStorage {
                 }
 
                 // Step 7: Cleanup
+                Log.d(DTAG, "migrateNonBiometricWithBackup() Step 7/7: Cleanup...");
                 Log.d(TAG, "Step 7/7: Cleaning up - deleting _BACKUP, _MIGRATED markers, updating markers, deleting old keys...");
 
                 // Delete all _BACKUP entries and _MIGRATED markers
@@ -1731,12 +1810,14 @@ public class FlutterSecureStorage {
                 // Update storageCipher to current
                 storageCipher = currentCipher;
 
+                Log.d(DTAG, "========== migrateNonBiometricWithBackup() COMPLETE — " + decryptedCache.size() + " items ==========");
                 Log.i(TAG, "Non-biometric migration WITH BACKUP completed successfully!");
                 Log.i(TAG, "Migrated " + decryptedCache.size() + " data items with new algorithm.");
 
                 callback.onSuccess(null);
 
             } catch (Exception e) {
+                Log.e(DTAG, "migrateNonBiometricWithBackup() FAILED: " + e.getMessage());
                 Log.e(TAG, "Non-biometric migration with backup failed", e);
                 callback.onError(new Exception("Non-biometric migration with backup failed", e));
             }
@@ -1744,6 +1825,8 @@ public class FlutterSecureStorage {
         private Map<String, String> decryptAllWithSavedCipherFromBackup(SharedPreferences dataSource,
                                                                          SharedPreferences espSource,
                                                                          StorageCipher savedStorageCipher) throws Exception {
+            Log.d(DTAG, "decryptAllWithSavedCipherFromBackup() START — cipher: " + savedStorageCipher.getClass().getSimpleName()
+                    + ", espSource=" + (espSource != null ? "present" : "null"));
             Map<String, String> decryptedCache = new HashMap<>();
             int encryptedCount = 0;
             int espCount = 0;
@@ -1792,7 +1875,9 @@ public class FlutterSecureStorage {
 
                         decryptedCache.put(originalKey, plainValue);
                         encryptedCount++;
+                        Log.d(DTAG, "decryptAllFromBackup() — decrypted _BACKUP key OK: " + originalKey);
                     } catch (Exception decryptError) {
+                        Log.e(DTAG, "decryptAllFromBackup() — FAILED to decrypt _BACKUP key: " + key + " — " + decryptError.getMessage());
                         Log.e(TAG, "Failed to decrypt _BACKUP key (skipping): " + key, decryptError);
                     }
                 }

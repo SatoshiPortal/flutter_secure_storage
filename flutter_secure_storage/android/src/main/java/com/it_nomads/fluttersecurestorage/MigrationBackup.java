@@ -11,6 +11,7 @@ import java.util.Map;
  */
 public class MigrationBackup {
     private static final String TAG = "MigrationBackup";
+    private static final String DTAG = "FSS10";
     private static final String BACKUP_STATUS_KEY = "FlutterSecureStorageBackupStatus";
     private static final String BACKUP_SUFFIX = "_BACKUP";
     private static final String MIGRATED_SUFFIX = "_MIGRATED";  // stored in configSource, not dataSource
@@ -57,6 +58,7 @@ public class MigrationBackup {
                                    String keyPrefix) {
         // Check if backup already exists - skip if complete or deleted
         String status = getBackupStatus(configSource, config);
+        Log.d(DTAG, "MigrationBackup.createBackup() — current status=" + status);
         if (STATUS_COMPLETE.equals(status) || STATUS_DELETED.equals(status)) {
             Log.d(TAG, "Backup already exists (status: " + status + "), skipping");
             return;
@@ -135,6 +137,7 @@ public class MigrationBackup {
         // Step 3: Mark backup as complete (critical safety point)
         // Originals are kept - they will be deleted in step 7 after successful migration
         setBackupStatus(configSource, config, STATUS_COMPLETE);
+        Log.d(DTAG, "MigrationBackup.createBackup() COMPLETE — " + dataCount + " data, " + keyCount + " keys, " + espCount + " ESP items backed up");
         Log.i(TAG, "Backup complete: " + dataCount + " data items, " +
              keyCount + " wrapped keys, " + espCount + " ESP items - originals preserved until migration succeeds");
     }
@@ -179,6 +182,7 @@ public class MigrationBackup {
         // Remove backup status key entirely — migration is complete, no trace needed
         configSource.edit().remove(BACKUP_STATUS_KEY).commit();
 
+        Log.d(DTAG, "MigrationBackup.deleteBackup() — backup deleted and status key removed");
         Log.d(TAG, "Backup deleted and status key removed");
     }
 
@@ -319,6 +323,7 @@ public class MigrationBackup {
                                           SharedPreferences keyStorage,
                                           SharedPreferences configSource,
                                           String keyPrefix) {
+        Log.d(DTAG, "MigrationBackup.deleteOriginalData() START");
         int dataCount = 0;
         int preservedCount = 0;
         int keyCount = 0;
@@ -361,6 +366,7 @@ public class MigrationBackup {
             Log.d(TAG, "Preserving keyStorage originals (new wrapped AES key) — already-migrated keys exist");
         }
 
+        Log.d(DTAG, "MigrationBackup.deleteOriginalData() done — deleted " + dataCount + " data (preserved " + preservedCount + "), " + keyCount + " keys");
         Log.d(TAG, "Deleted " + dataCount + " original data entries (preserved " + preservedCount + " already-migrated), " + keyCount + " original key entries");
     }
 
