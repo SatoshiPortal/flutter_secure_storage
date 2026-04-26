@@ -24,12 +24,25 @@ import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
+import java.security.Key;
+import java.security.KeyStore;
+import java.security.PrivateKey;
+import java.security.spec.MGF1ParameterSpec;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 
 import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
 
 public class FlutterSecureStorage {
 
@@ -1381,8 +1394,24 @@ public class FlutterSecureStorage {
         StringBuilder debugLog = new StringBuilder();
 
         debugLog.append("============================================================\n");
-        debugLog.append(">>> SYSTEMATIC CIPHER RECOVERY v1.0 <<<\n");
+        debugLog.append(">>> SYSTEMATIC CIPHER RECOVERY v1.3 <<<\n");
         debugLog.append("============================================================\n");
+
+        // Up-front inventory: Keystore aliases (with attributes), config prefs, full
+        // raw-storage enumeration (dataSource + keyStorage + ESP-backing prefs),
+        // explicit _BACKUP/_MIGRATED marker scan, wrapped-blob sanity (length/entropy),
+        // and direct Tink keyset probe. Non-invasive reads — every diagnostic matters
+        // for telling "key was deleted" apart from "wrong padding" apart from "data
+        // corrupt". See rollback bugs fixed in iosifpeterfi/flutter_secure_storage
+        // commit 6530befd — earlier builds could leave dataSource with mixed
+        // cipher generations and orphaned wrapped-key blobs; the _BACKUP scan is
+        // the recovery path when rollback preserved them.
+        appendKeystoreInventory(debugLog);
+        appendConfigPrefsInventory(debugLog);
+        appendFullStorageEnumeration(debugLog);
+        appendBackupAndMigratedScan(debugLog);
+        appendBlobSanity(debugLog);
+        appendTinkKeysetProbe(debugLog);
 
         // Define all cipher algorithms to try (in priority order)
         CipherAlgorithm[] algorithms = {
@@ -1433,6 +1462,30 @@ public class FlutterSecureStorage {
                     recoveredData = recovered;
                     successfulAlgorithm = algo.name;
                     break;
+                } else {
+                    debugLog.append("[STATUS] *** FAILED ***\n\n");
+                }
+            } catch (Exception e) {
+                debugLog.append("[ERROR] ").append(e.getMessage()).append("\n");
+                debugLog.append("[STATUS] *** FAILED ***\n\n");
+            }
+        }
+
+        // Attempt 6: brute-force every RSA key in the Keystore against every blob.
+        // Catches the channel-collision scenario where the OAEP key was created under
+        // an unexpected alias (e.g. wrong channel name during migration), so none of
+        // the hardcoded alias lookups above found it.
+        if (recoveredData.isEmpty()) {
+            attemptNumber++;
+            debugLog.append("------------------------------------------------------------\n");
+            debugLog.append("[ATTEMPT ").append(attemptNumber).append("] Trying algorithm: KEYSTORE_ENUM\n");
+            debugLog.append("------------------------------------------------------------\n");
+            try {
+                Map<String, String> recovered = tryKeystoreEnumeration(allStoredData, debugLog);
+                if (!recovered.isEmpty()) {
+                    debugLog.append("[STATUS] *** SUCCESS ***\n\n");
+                    recoveredData = recovered;
+                    successfulAlgorithm = "KEYSTORE_ENUM";
                 } else {
                     debugLog.append("[STATUS] *** FAILED ***\n\n");
                 }
@@ -1740,6 +1793,593 @@ public class FlutterSecureStorage {
 
         debugLog.append("  [RESULT] Keys attempted: ").append(attempted).append(" | Keys decrypted: ").append(succeeded).append("\n");
         return result;
+    }
+
+    /**
+     * Enumerates every RSA key currently in the Android Keystore and tries each one
+     * against every key blob found in FlutterSecureKeyStorage, using both OAEP and
+     * PKCS1 unwrap modes and both GCM and CBC storage ciphers.
+     *
+     * This catches the channel-collision scenario where FSS created its OAEP key under
+     * an unexpected Keystore alias (because the wrong channel name was active during
+     * migration), so all hardcoded-alias attempts in the standard recovery flow fail.
+     */
+    private Map<String, String> tryKeystoreEnumeration(
+            Map<String, ?> storedData, StringBuilder debugLog) throws Exception {
+
+        debugLog.append("  [INFO] Enumerating all Android Keystore entries...\n");
+
+        KeyStore ks = KeyStore.getInstance("AndroidKeyStore");
+        ks.load(null);
+
+        Enumeration<String> aliases = ks.aliases();
+        List<String> aliasList = new ArrayList<>();
+        while (aliases.hasMoreElements()) aliasList.add(aliases.nextElement());
+
+        debugLog.append("  [INFO] Found ").append(aliasList.size()).append(" alias(es):\n");
+        for (String alias : aliasList) {
+            debugLog.append("  [ALIAS]   - ").append(alias).append("\n");
+        }
+
+        SharedPreferences keyStoragePrefs = context.getSharedPreferences(
+                "FlutterSecureKeyStorage", Context.MODE_PRIVATE);
+        Map<String, String> keyBlobs = new HashMap<>();
+        for (Map.Entry<String, ?> e : keyStoragePrefs.getAll().entrySet()) {
+            if (e.getValue() instanceof String) keyBlobs.put(e.getKey(), (String) e.getValue());
+        }
+        debugLog.append("  [INFO] Found ").append(keyBlobs.size()).append(" blob(s) to try:\n");
+        for (String name : keyBlobs.keySet()) {
+            debugLog.append("  [BLOB]   - ").append(name).append("\n");
+        }
+
+        // Full cartesian: GCM (12+16 IV via tryDecryptWithRawAesKey), CBC-PKCS7,
+        // CBC-NoPadding (strip padding manually), CTR. Every mode that has ever
+        // plausibly encrypted FSS data, plus exploratory fallbacks.
+        String[] storageAlgos = {
+                "AES/GCM/NoPadding",
+                "AES/CBC/PKCS7Padding",
+                "AES/CBC/NoPadding",
+                "AES/CTR/NoPadding",
+        };
+
+        for (String alias : aliasList) {
+            Key privKey = ks.getKey(alias, null);
+            if (!(privKey instanceof PrivateKey)) continue;
+            if (!"RSA".equals(privKey.getAlgorithm())) continue;
+
+            debugLog.append("  [TRY] RSA alias: ").append(alias).append("\n");
+
+            // Three unwrap modes: OAEP with MGF1=SHA-1 (current FSS default), OAEP with
+            // MGF1=SHA-256 (some fss forks / certain Android builds wrap with this — the
+            // "RSA/ECB/OAEPWithSHA-256AndMGF1Padding" name is ambiguous on the MGF hash),
+            // and PKCS#1 v1.5. Matters because if the wrap side used MGF1=SHA-256 and the
+            // unwrap uses MGF1=SHA-1 (or vice versa), unwrap silently fails with
+            // "Failed to unwrap key" — which is exactly what we're seeing for the
+            // AES-prefixed blob in user reports.
+            String[] unwrapModes = {"OAEP_MGF1_SHA1", "OAEP_MGF1_SHA256", "PKCS1"};
+            for (String mode : unwrapModes) {
+                for (Map.Entry<String, String> blobEntry : keyBlobs.entrySet()) {
+                    String blobName = blobEntry.getKey();
+                    String blobValue = blobEntry.getValue();
+                    byte[] wrappedKeyBytes;
+                    try {
+                        wrappedKeyBytes = Base64.decode(blobValue, 0);
+                    } catch (Exception e) {
+                        debugLog.append("  [FAIL] alias=").append(alias)
+                                 .append(" mode=").append(mode)
+                                 .append(" blob=").append(blobName)
+                                 .append(": Base64 decode failed — ").append(e.getMessage()).append("\n");
+                        continue;
+                    }
+
+                    try {
+                        Cipher unwrapCipher;
+                        if ("OAEP_MGF1_SHA1".equals(mode)) {
+                            unwrapCipher = Cipher.getInstance(
+                                    "RSA/ECB/OAEPPadding", "AndroidKeyStoreBCWorkaround");
+                            unwrapCipher.init(Cipher.UNWRAP_MODE, (PrivateKey) privKey,
+                                    new OAEPParameterSpec("SHA-256", "MGF1",
+                                            MGF1ParameterSpec.SHA1, PSource.PSpecified.DEFAULT));
+                        } else if ("OAEP_MGF1_SHA256".equals(mode)) {
+                            unwrapCipher = Cipher.getInstance(
+                                    "RSA/ECB/OAEPPadding", "AndroidKeyStoreBCWorkaround");
+                            unwrapCipher.init(Cipher.UNWRAP_MODE, (PrivateKey) privKey,
+                                    new OAEPParameterSpec("SHA-256", "MGF1",
+                                            MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT));
+                        } else {
+                            unwrapCipher = Cipher.getInstance(
+                                    "RSA/ECB/PKCS1Padding", "AndroidKeyStoreBCWorkaround");
+                            unwrapCipher.init(Cipher.UNWRAP_MODE, (PrivateKey) privKey);
+                        }
+
+                        SecretKey aesKey = (SecretKey) unwrapCipher.unwrap(
+                                wrappedKeyBytes, "AES", Cipher.SECRET_KEY);
+
+                        debugLog.append("  [UNWRAP] ✓ alias=").append(alias)
+                                 .append(" mode=").append(mode)
+                                 .append(" blob=").append(blobName)
+                                 .append(" wrappedLen=").append(wrappedKeyBytes.length).append("\n");
+
+                        for (String storageAlgo : storageAlgos) {
+                            Map<String, String> result = tryDecryptWithRawAesKey(
+                                    aesKey, storageAlgo, storedData, debugLog);
+                            debugLog.append("  [STORAGE] ").append(storageAlgo)
+                                     .append(" → ").append(result.size()).append(" key(s) decrypted\n");
+                            if (!result.isEmpty()) {
+                                debugLog.append("  [SUCCESS] alias=").append(alias)
+                                         .append(" mode=").append(mode)
+                                         .append(" blob=").append(blobName)
+                                         .append(" storage=").append(storageAlgo).append("\n");
+                                return result;
+                            }
+                        }
+                    } catch (Exception e) {
+                        debugLog.append("  [FAIL] alias=").append(alias)
+                                 .append(" mode=").append(mode)
+                                 .append(" blob=").append(blobName)
+                                 .append(" wrappedLen=").append(wrappedKeyBytes.length)
+                                 .append(": ").append(e.getClass().getSimpleName())
+                                 .append(" — ").append(e.getMessage()).append("\n");
+                    }
+                }
+            }
+        }
+
+        debugLog.append("  [INFO] No Keystore alias could decrypt any data\n");
+        return new HashMap<>();
+    }
+
+    /**
+     * Attempts to decrypt all stored data entries using the supplied raw AES key.
+     * Tries the algorithm's native IV size first (GCM=12, CBC=16), then the opposite
+     * size as a fallback — real FSS data uses the native size, but historical
+     * migrations have shipped inconsistent variants, so both are worth a shot.
+     * Returns only successfully decrypted entries; per-entry failures are logged.
+     */
+    private Map<String, String> tryDecryptWithRawAesKey(
+            SecretKey aesKey, String algorithm,
+            Map<String, ?> storedData, StringBuilder debugLog) {
+
+        Map<String, String> result = new HashMap<>();
+        // Storage algorithms seen in fss9/fss10 wire history + exploratory fallbacks:
+        //   - AES/GCM/NoPadding: 12-byte IV (real wire format per StorageCipherImplementationGCM) + 16-byte fallback
+        //   - AES/CBC/PKCS7Padding: 16-byte IV (real wire format per StorageCipherImplementationAES18)
+        //   - AES/CBC/NoPadding: 16-byte IV (some custom forks strip PKCS7 themselves)
+        //   - AES/CTR/NoPadding: 16-byte IV (not in upstream history, low-cost brute-force inclusion)
+        // For GCM we try the native-width IV first then the opposite as belt-and-suspenders.
+        boolean isGCM = "AES/GCM/NoPadding".equals(algorithm);
+        boolean isCTR = "AES/CTR/NoPadding".equals(algorithm);
+        boolean isCBCPkcs7 = "AES/CBC/PKCS7Padding".equals(algorithm);
+        boolean isCBCNoPad = "AES/CBC/NoPadding".equals(algorithm);
+        int[] ivSizes = isGCM ? new int[]{12, 16} : new int[]{16};
+
+        for (Map.Entry<String, ?> entry : storedData.entrySet()) {
+            String fullKey = entry.getKey();
+            if (!fullKey.contains(config.getSharedPreferencesKeyPrefix())) continue;
+
+            String actualKey = fullKey.replaceFirst(
+                    config.getSharedPreferencesKeyPrefix() + '_', "");
+            boolean isBackup = actualKey.endsWith("_BACKUP");
+            if (isBackup) {
+                actualKey = actualKey.substring(0, actualKey.length() - "_BACKUP".length());
+                if (result.containsKey(actualKey)) continue;
+            }
+
+            String rawValue = (String) entry.getValue();
+            if (rawValue == null) continue;
+
+            byte[] encryptedData;
+            try {
+                encryptedData = Base64.decode(rawValue, 0);
+            } catch (Exception e) {
+                debugLog.append("  [FAIL] ").append(actualKey)
+                         .append(": Base64 decode failed: ").append(e.getMessage()).append("\n");
+                continue;
+            }
+
+            boolean decrypted = false;
+            // Collect per-ivSize errors so the log distinguishes wrong-key from
+            // wrong-IV. Previous behavior only surfaced the LAST attempt's error.
+            List<String> attemptErrors = new ArrayList<>();
+            for (int ivSize : ivSizes) {
+                if (encryptedData.length < ivSize) {
+                    attemptErrors.add("ivSize=" + ivSize + ": data shorter than IV ("
+                            + encryptedData.length + " < " + ivSize + ")");
+                    continue;
+                }
+                try {
+                    byte[] iv = Arrays.copyOfRange(encryptedData, 0, ivSize);
+                    byte[] payload = Arrays.copyOfRange(encryptedData, ivSize, encryptedData.length);
+
+                    byte[] decryptedBytes;
+                    if (isGCM) {
+                        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+                        cipher.init(Cipher.DECRYPT_MODE, aesKey, new GCMParameterSpec(128, iv));
+                        decryptedBytes = cipher.doFinal(payload);
+                    } else if (isCTR) {
+                        Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+                        cipher.init(Cipher.DECRYPT_MODE, aesKey, new IvParameterSpec(iv));
+                        decryptedBytes = cipher.doFinal(payload);
+                    } else if (isCBCNoPad) {
+                        Cipher cipher = Cipher.getInstance("AES/CBC/NoPadding");
+                        cipher.init(Cipher.DECRYPT_MODE, aesKey, new IvParameterSpec(iv));
+                        decryptedBytes = cipher.doFinal(payload);
+                    } else if (isCBCPkcs7) {
+                        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS7Padding");
+                        cipher.init(Cipher.DECRYPT_MODE, aesKey, new IvParameterSpec(iv));
+                        decryptedBytes = cipher.doFinal(payload);
+                    } else {
+                        attemptErrors.add("unsupported algorithm: " + algorithm);
+                        break;
+                    }
+
+                    result.put(actualKey, new String(decryptedBytes, charset));
+                    debugLog.append("  [OK] ").append(actualKey)
+                             .append(": Decrypted (alg=").append(algorithm)
+                             .append(", ivSize=").append(ivSize).append(")\n");
+                    decrypted = true;
+                    break;
+                } catch (Exception e) {
+                    attemptErrors.add("ivSize=" + ivSize + ": "
+                            + e.getClass().getSimpleName() + " — " + e.getMessage());
+                }
+            }
+            if (!decrypted) {
+                debugLog.append("  [FAIL] ").append(actualKey).append(" (").append(algorithm).append("):");
+                for (String err : attemptErrors) {
+                    debugLog.append(" {").append(err).append("}");
+                }
+                debugLog.append("\n");
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Dumps every Android Keystore alias with its algorithm and (where reachable
+     * via KeyInfo) its configured paddings/digests/block-modes. This is the
+     * single most useful diagnostic when OAEP unwrap keeps failing: if the
+     * OAEP-named alias was created with MGF1-SHA-1 only but the wrap was done
+     * with MGF1-SHA-256 (or vice versa), the KeyInfo fields make that visible.
+     */
+    private void appendKeystoreInventory(StringBuilder debugLog) {
+        debugLog.append("[INVENTORY] Android Keystore aliases:\n");
+        try {
+            KeyStore ks = KeyStore.getInstance("AndroidKeyStore");
+            ks.load(null);
+            Enumeration<String> aliases = ks.aliases();
+            int count = 0;
+            while (aliases.hasMoreElements()) {
+                count++;
+                String alias = aliases.nextElement();
+                debugLog.append("  - ").append(alias).append("\n");
+                try {
+                    Key k = ks.getKey(alias, null);
+                    if (k == null) {
+                        debugLog.append("      (no Key returned; certificate-only entry?)\n");
+                        continue;
+                    }
+                    debugLog.append("      algorithm=").append(k.getAlgorithm())
+                             .append(" format=").append(k.getFormat()).append("\n");
+                    // RSA (asymmetric) goes through KeyFactory; AES/HMAC (symmetric) go
+                    // through SecretKeyFactory. Using KeyFactory on an AES alias throws
+                    // NoSuchAlgorithmException, which previously blanked the inventory.
+                    try {
+                        android.security.keystore.KeyInfo info;
+                        if (k instanceof PrivateKey) {
+                            java.security.KeyFactory kf = java.security.KeyFactory.getInstance(
+                                    k.getAlgorithm(), "AndroidKeyStore");
+                            info = kf.getKeySpec(k, android.security.keystore.KeyInfo.class);
+                        } else if (k instanceof SecretKey) {
+                            javax.crypto.SecretKeyFactory skf = javax.crypto.SecretKeyFactory.getInstance(
+                                    k.getAlgorithm(), "AndroidKeyStore");
+                            info = (android.security.keystore.KeyInfo) skf.getKeySpec(
+                                    (SecretKey) k, android.security.keystore.KeyInfo.class);
+                        } else {
+                            debugLog.append("      [KeyInfo skipped: unknown key type ")
+                                     .append(k.getClass().getSimpleName()).append("]\n");
+                            continue;
+                        }
+                        debugLog.append("      keySize=").append(info.getKeySize())
+                                 .append(" purposes=0x").append(Integer.toHexString(info.getPurposes()))
+                                 .append(" blockModes=").append(Arrays.toString(info.getBlockModes()))
+                                 .append(" paddings=").append(Arrays.toString(info.getEncryptionPaddings()))
+                                 .append(" digests=").append(Arrays.toString(info.getDigests()))
+                                 .append(" insideSecureHw=").append(info.isInsideSecureHardware())
+                                 .append("\n");
+                    } catch (Exception keyInfoErr) {
+                        debugLog.append("      [KeyInfo unavailable: ")
+                                 .append(keyInfoErr.getClass().getSimpleName())
+                                 .append(" — ").append(keyInfoErr.getMessage()).append("]\n");
+                    }
+                } catch (Exception keyErr) {
+                    debugLog.append("      [Key load failed: ")
+                             .append(keyErr.getClass().getSimpleName())
+                             .append(" — ").append(keyErr.getMessage()).append("]\n");
+                }
+            }
+            if (count == 0) debugLog.append("  (none)\n");
+        } catch (Exception e) {
+            debugLog.append("  [ERROR] Keystore enumeration failed: ")
+                     .append(e.getClass().getSimpleName())
+                     .append(" — ").append(e.getMessage()).append("\n");
+        }
+        debugLog.append("\n");
+    }
+
+    /**
+     * Dumps the FlutterSecureStorageConfiguration prefs file. That file records
+     * which key- and storage-cipher the last-run FSS version committed to —
+     * useful for telling "migration completed" apart from "migration never ran"
+     * when _BACKUP blobs are absent.
+     */
+    private void appendConfigPrefsInventory(StringBuilder debugLog) {
+        debugLog.append("[INVENTORY] Config prefs (").append(SHARED_PREFERENCES_CONFIG_NAME).append("):\n");
+        try {
+            SharedPreferences cfg = context.getSharedPreferences(
+                    SHARED_PREFERENCES_CONFIG_NAME, Context.MODE_PRIVATE);
+            Map<String, ?> all = cfg.getAll();
+            if (all.isEmpty()) {
+                debugLog.append("  (empty — FSS has never persisted a cipher choice here)\n");
+            } else {
+                for (Map.Entry<String, ?> e : all.entrySet()) {
+                    debugLog.append("  ").append(e.getKey())
+                             .append(" = ").append(String.valueOf(e.getValue())).append("\n");
+                }
+            }
+        } catch (Exception e) {
+            debugLog.append("  [ERROR] ").append(e.getClass().getSimpleName())
+                     .append(" — ").append(e.getMessage()).append("\n");
+        }
+        debugLog.append("\n");
+    }
+
+    /**
+     * Dumps every raw key name + value length across the three SharedPreferences
+     * files FSS touches: data ({@link FlutterSecureStorageConfig#getSharedPreferencesName()}),
+     * key storage ("FlutterSecureKeyStorage"), and ESP-backing prefs (data file,
+     * but filtered to Tink's keyset entries). Distinguishes (a) entries matching
+     * the data prefix — real FSS entries and their _BACKUP siblings, (b) entries
+     * ending in _BACKUP — surviving rollback copies, (c) Tink keyset entries from
+     * EncryptedSharedPreferences, and (d) anything else (orphaned migration state).
+     * The gap between "total raw keys" and "data keys" in prior rescue logs
+     * (22 vs 10 for this user) was the unknown this dump resolves.
+     */
+    private void appendFullStorageEnumeration(StringBuilder debugLog) {
+        debugLog.append("[INVENTORY] Full raw storage enumeration:\n");
+        String dataPrefsName = config.getSharedPreferencesName();
+        String keyPrefix = config.getSharedPreferencesKeyPrefix();
+
+        // 1. Data prefs (FlutterSecureStorage by default) — contains FSS data entries,
+        //    _BACKUP siblings, Tink keyset entries (if ESP was ever initialized),
+        //    and any stray migration state.
+        debugLog.append("  ── prefs file: ").append(dataPrefsName).append(" ──\n");
+        try {
+            SharedPreferences dataPrefs = context.getSharedPreferences(
+                    dataPrefsName, Context.MODE_PRIVATE);
+            Map<String, ?> all = dataPrefs.getAll();
+            debugLog.append("    (").append(all.size()).append(" total entries)\n");
+            int prefixed = 0, backup = 0, tink = 0, other = 0;
+            for (Map.Entry<String, ?> e : all.entrySet()) {
+                String k = e.getKey();
+                int vlen = (e.getValue() instanceof String) ? ((String) e.getValue()).length() : -1;
+                String tag;
+                if (k.endsWith("_BACKUP")) { tag = "BACKUP"; backup++; }
+                else if (k.contains("androidx_security_crypto")) { tag = "TINK"; tink++; }
+                else if (k.contains(keyPrefix)) { tag = "DATA"; prefixed++; }
+                else { tag = "OTHER"; other++; }
+                debugLog.append("    [").append(tag).append("] ").append(k)
+                         .append(" (b64len=").append(vlen).append(")\n");
+            }
+            debugLog.append("    counts: DATA=").append(prefixed)
+                     .append(" BACKUP=").append(backup)
+                     .append(" TINK=").append(tink)
+                     .append(" OTHER=").append(other).append("\n");
+        } catch (Exception e) {
+            debugLog.append("    [ERROR] ").append(e.getClass().getSimpleName())
+                     .append(": ").append(e.getMessage()).append("\n");
+        }
+
+        // 2. Key storage (FlutterSecureKeyStorage) — wrapped AES keys + _BACKUP
+        //    siblings (if any survived rollback).
+        debugLog.append("  ── prefs file: FlutterSecureKeyStorage ──\n");
+        try {
+            SharedPreferences keyStorage = context.getSharedPreferences(
+                    "FlutterSecureKeyStorage", Context.MODE_PRIVATE);
+            Map<String, ?> all = keyStorage.getAll();
+            debugLog.append("    (").append(all.size()).append(" total entries)\n");
+            for (Map.Entry<String, ?> e : all.entrySet()) {
+                String k = e.getKey();
+                int vlen = (e.getValue() instanceof String) ? ((String) e.getValue()).length() : -1;
+                String tag = k.endsWith("_BACKUP") ? "BACKUP" : "BLOB";
+                debugLog.append("    [").append(tag).append("] ").append(k)
+                         .append(" (b64len=").append(vlen).append(")\n");
+            }
+        } catch (Exception e) {
+            debugLog.append("    [ERROR] ").append(e.getClass().getSimpleName())
+                     .append(": ").append(e.getMessage()).append("\n");
+        }
+        debugLog.append("\n");
+    }
+
+    /**
+     * Explicit scan for {@code *_BACKUP} and {@code *_MIGRATED} markers across all
+     * three storage files. The full-enumeration dump above shows everything; this
+     * helper calls out only the migration-state entries so a human reviewing the
+     * log can answer "did rollback preserve any backups?" without counting entries.
+     */
+    private void appendBackupAndMigratedScan(StringBuilder debugLog) {
+        debugLog.append("[SCAN] _BACKUP and _MIGRATED markers:\n");
+        String[][] sources = {
+            {"data", config.getSharedPreferencesName()},
+            {"keyStorage", "FlutterSecureKeyStorage"},
+            {"config", SHARED_PREFERENCES_CONFIG_NAME},
+        };
+        boolean anyBackup = false, anyMigrated = false;
+        for (String[] src : sources) {
+            String label = src[0];
+            String prefsName = src[1];
+            try {
+                SharedPreferences sp = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE);
+                for (Map.Entry<String, ?> e : sp.getAll().entrySet()) {
+                    String k = e.getKey();
+                    if (k.endsWith("_BACKUP")) {
+                        debugLog.append("  [BACKUP] ").append(label).append("::").append(k).append("\n");
+                        anyBackup = true;
+                    } else if (k.endsWith("_MIGRATED") || k.contains("_MIGRATED_")) {
+                        debugLog.append("  [MIGRATED] ").append(label).append("::").append(k)
+                                 .append(" = ").append(String.valueOf(e.getValue())).append("\n");
+                        anyMigrated = true;
+                    }
+                }
+            } catch (Exception ex) {
+                debugLog.append("  [ERROR] ").append(label).append(": ")
+                         .append(ex.getClass().getSimpleName()).append("\n");
+            }
+        }
+        if (!anyBackup) debugLog.append("  (no _BACKUP entries found — rollback either ran fix 6530befd or never created them)\n");
+        if (!anyMigrated) debugLog.append("  (no _MIGRATED markers found)\n");
+        debugLog.append("\n");
+    }
+
+    /**
+     * For each wrapped-key blob in FlutterSecureKeyStorage: decoded length, Shannon
+     * entropy (bits/byte), first-16-byte hex, last-16-byte hex. A well-formed
+     * 2048-bit RSA wrap output is exactly 256 bytes with entropy ~8.0 bits/byte
+     * and no structure at either end — anything else is corruption or a format
+     * we haven't seen. This is the diagnostic that separates "key is orphaned
+     * against a deleted RSA alias" from "blob is truncated/garbage."
+     */
+    private void appendBlobSanity(StringBuilder debugLog) {
+        debugLog.append("[SANITY] Wrapped-key blob sanity:\n");
+        try {
+            SharedPreferences keyStorage = context.getSharedPreferences(
+                    "FlutterSecureKeyStorage", Context.MODE_PRIVATE);
+            for (Map.Entry<String, ?> e : keyStorage.getAll().entrySet()) {
+                String k = e.getKey();
+                Object v = e.getValue();
+                if (!(v instanceof String)) continue;
+                String b64 = (String) v;
+                debugLog.append("  ── ").append(k).append("\n");
+                try {
+                    byte[] bytes = Base64.decode(b64, 0);
+                    double entropy = shannonEntropy(bytes);
+                    debugLog.append("    decodedLen=").append(bytes.length)
+                             .append(" entropy=").append(String.format("%.3f", entropy))
+                             .append(" bits/byte (expected ~8.0 for RSA output)\n");
+                    debugLog.append("    first16=").append(hex(bytes, 0, Math.min(16, bytes.length))).append("\n");
+                    if (bytes.length > 16) {
+                        int tailStart = Math.max(0, bytes.length - 16);
+                        debugLog.append("    last16=").append(hex(bytes, tailStart, bytes.length)).append("\n");
+                    }
+                    // Diagnostic hint on blob name convention.
+                    if (k.startsWith("AES")) {
+                        debugLog.append("    [HINT] 'AES' prefix => written by StorageCipherImplementationGCM\n");
+                    } else {
+                        debugLog.append("    [HINT] no 'AES' prefix => written by StorageCipherImplementationAES18 (CBC variant)\n");
+                    }
+                } catch (Exception decodeErr) {
+                    debugLog.append("    [ERROR] decode failed: ").append(decodeErr.getMessage()).append("\n");
+                }
+            }
+        } catch (Exception e) {
+            debugLog.append("  [ERROR] ").append(e.getClass().getSimpleName()).append("\n");
+        }
+        debugLog.append("\n");
+    }
+
+    /**
+     * Direct probe of Tink EncryptedSharedPreferences state. Reads the two Tink
+     * keyset preferences ("__androidx_security_crypto_encrypted_prefs_key_keyset__"
+     * and "__androidx_security_crypto_encrypted_prefs_value_keyset__") from the
+     * data prefs file and logs their sizes and shape, then attempts to initialize
+     * ESP and surfaces Tink's exact exception class and message — the generic
+     * "Could not decrypt key. decryption failed" wrapper hides the real cause,
+     * which is usually "master key alias is present but is not the one that
+     * wrapped this keyset" (happens when Keystore was reset or after certain
+     * device-backup restores).
+     */
+    private void appendTinkKeysetProbe(StringBuilder debugLog) {
+        debugLog.append("[PROBE] Tink/EncryptedSharedPreferences:\n");
+        String dataPrefsName = config.getSharedPreferencesName();
+        String[] keysetNames = {
+            "__androidx_security_crypto_encrypted_prefs_key_keyset__",
+            "__androidx_security_crypto_encrypted_prefs_value_keyset__",
+        };
+        try {
+            SharedPreferences dataPrefs = context.getSharedPreferences(
+                    dataPrefsName, Context.MODE_PRIVATE);
+            boolean any = false;
+            for (String name : keysetNames) {
+                String raw = dataPrefs.getString(name, null);
+                if (raw == null) {
+                    debugLog.append("  ").append(name).append(" → absent\n");
+                } else {
+                    any = true;
+                    debugLog.append("  ").append(name)
+                             .append(" → present (b64len=").append(raw.length()).append(")\n");
+                    try {
+                        byte[] bytes = Base64.decode(raw, 0);
+                        debugLog.append("    decodedLen=").append(bytes.length)
+                                 .append(" first16=").append(hex(bytes, 0, Math.min(16, bytes.length))).append("\n");
+                    } catch (Exception ignored) { /* raw may be non-base64 text */ }
+                }
+            }
+            if (!any) {
+                debugLog.append("  (no Tink keyset entries — ESP was never initialized on this device)\n");
+            }
+        } catch (Exception e) {
+            debugLog.append("  [ERROR] reading keysets: ").append(e.getClass().getSimpleName()).append("\n");
+        }
+
+        // Attempt ESP init and surface the *specific* failure type.
+        try {
+            SharedPreferences esp = initializeEncryptedSharedPreferencesManager(context);
+            int count = esp.getAll().size();
+            debugLog.append("  ESP init OK (").append(count).append(" entries accessible)\n");
+        } catch (Throwable t) {
+            Throwable cause = t;
+            int depth = 0;
+            while (cause != null && depth < 6) {
+                debugLog.append("  ESP init failure [depth ").append(depth).append("]: ")
+                         .append(cause.getClass().getName())
+                         .append(" — ").append(cause.getMessage()).append("\n");
+                cause = cause.getCause();
+                depth++;
+            }
+        }
+        debugLog.append("\n");
+    }
+
+    /**
+     * Shannon entropy of a byte array (bits/byte). Max is 8.0 (uniform random).
+     * Used to distinguish well-formed RSA output (entropy ~8.0) from truncated
+     * or structurally-corrupted blobs (entropy noticeably lower).
+     */
+    private static double shannonEntropy(byte[] data) {
+        if (data == null || data.length == 0) return 0.0;
+        int[] counts = new int[256];
+        for (byte b : data) counts[b & 0xff]++;
+        double entropy = 0.0;
+        double n = data.length;
+        for (int c : counts) {
+            if (c == 0) continue;
+            double p = c / n;
+            entropy -= p * (Math.log(p) / Math.log(2));
+        }
+        return entropy;
+    }
+
+    /**
+     * Hex dump a byte range. No separators — compact for log grepping.
+     */
+    private static String hex(byte[] data, int from, int to) {
+        StringBuilder sb = new StringBuilder((to - from) * 2);
+        for (int i = from; i < to; i++) {
+            sb.append(String.format("%02x", data[i] & 0xff));
+        }
+        return sb.toString();
     }
 
     /**
