@@ -26,26 +26,36 @@ public class StorageCipherFactory {
         final String savedKeyCipherAlgorithm = configSource.getString(ELEMENT_PREFERENCES_ALGORITHM_KEY, null);
         final String savedStorageCipherAlgorithm = configSource.getString(ELEMENT_PREFERENCES_ALGORITHM_STORAGE, null);
 
+        // Compute current algorithms first so we can use them as the saved
+        // baseline below when migrateOnAlgorithmChange is disabled.
+        final StorageCipherAlgorithm currentStorageAlgorithmTmp = StorageCipherAlgorithm.fromString(storageCipherAlgorithm);
+        currentStorageAlgorithm = (currentStorageAlgorithmTmp.minVersionCode <= Build.VERSION.SDK_INT) ? currentStorageAlgorithmTmp : DEFAULT_STORAGE_ALGORITHM;
+
+        final KeyCipherAlgorithm currentKeyAlgorithmTmp = KeyCipherAlgorithm.fromString(keyCipherAlgorithm);
+        currentKeyAlgorithm = (currentKeyAlgorithmTmp.minVersionCode <= Build.VERSION.SDK_INT) ? currentKeyAlgorithmTmp : DEFAULT_KEY_ALGORITHM;
+
         if (savedKeyCipherAlgorithm == null || savedStorageCipherAlgorithm == null) {
-            // Migration from v9.2.4 or v10.0.0-beta.4:
-            // No algorithm markers exist in SharedPreferences, which means the data was encrypted
-            // with the historical v9.2.4 defaults. We must use these defaults to decrypt the old
-            // data, even if the current config specifies different algorithms.
-            // After successful decryption, the data will be re-encrypted with current algorithms
-            // (if they differ) via the migration flow in handleKeyMismatch().
-            savedKeyAlgorithm = DEFAULT_KEY_ALGORITHM;        // RSA_ECB_PKCS1Padding
-            savedStorageAlgorithm = DEFAULT_STORAGE_ALGORITHM; // AES_CBC_PKCS7Padding
+            // No markers on disk. Two possible scenarios:
+            //   1. Fresh install — no prior data anywhere.
+            //   2. v9.2.4 upgrade with non-ESP custom-cipher data (PKCS1+CBC).
+            // We can't distinguish them from inside the factory, so use the
+            // migrateOnAlgorithmChange flag as the discriminator: callers
+            // who disable migration are asserting "no legacy custom-cipher
+            // data exists" — so saved=current, requiresReEncryption()=false,
+            // and cipher init proceeds without triggering handleKeyMismatch.
+            // Callers who enable migration get the historical v9.2.4
+            // defaults so handleKeyMismatch can decrypt-and-re-encrypt.
+            if (!config.shouldMigrateOnAlgorithmChange()) {
+                savedKeyAlgorithm = currentKeyAlgorithm;
+                savedStorageAlgorithm = currentStorageAlgorithm;
+            } else {
+                savedKeyAlgorithm = DEFAULT_KEY_ALGORITHM;        // RSA_ECB_PKCS1Padding
+                savedStorageAlgorithm = DEFAULT_STORAGE_ALGORITHM; // AES_CBC_PKCS7Padding
+            }
         } else {
             savedKeyAlgorithm = KeyCipherAlgorithm.fromString(savedKeyCipherAlgorithm);
             savedStorageAlgorithm = StorageCipherAlgorithm.fromString(savedStorageCipherAlgorithm);
         }
-
-        final StorageCipherAlgorithm currentStorageAlgorithmTmp = StorageCipherAlgorithm.fromString(storageCipherAlgorithm);
-        currentStorageAlgorithm = (currentStorageAlgorithmTmp.minVersionCode <= Build.VERSION.SDK_INT) ? currentStorageAlgorithmTmp : DEFAULT_STORAGE_ALGORITHM;
-
-        // Set current key algorithm with version check
-        final KeyCipherAlgorithm currentKeyAlgorithmTmp = KeyCipherAlgorithm.fromString(keyCipherAlgorithm);
-        currentKeyAlgorithm = (currentKeyAlgorithmTmp.minVersionCode <= Build.VERSION.SDK_INT) ? currentKeyAlgorithmTmp : DEFAULT_KEY_ALGORITHM;
 
         if (savedKeyCipherAlgorithm == null || savedStorageCipherAlgorithm == null) {
             // Don't write algorithm markers during migrateWithBackup
